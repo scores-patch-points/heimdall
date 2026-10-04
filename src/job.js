@@ -48,6 +48,11 @@ export const TASK_CLASSES = Object.freeze({
     capability: "verification",
     label: "does the declared condition hold",
   },
+  "formal.code": {
+    family: "formal",
+    capability: "composition",
+    label: "a program that satisfies a falsifying gate",
+  },
   "mechanical.compute": {
     family: "mechanical",
     capability: "compute",
@@ -126,6 +131,7 @@ export function taskClassFor(askShape) {
     summarize: "formal.summarize",
     counterfactual: "formal.counterfactual",
     compute: "mechanical.compute",
+    code: "formal.code",
   };
   for (const [key, cls] of Object.entries(table)) {
     if (s.includes(key)) return cls;
