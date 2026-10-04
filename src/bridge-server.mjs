@@ -42,6 +42,8 @@ import {
   loadLinks, saveLinks, upsertLink, removeLink, probeEndpoint,
   guessTag, resolveLink, linkAdvertisedModels, DEFAULT_LINKS_FILE,
 } from "./links.mjs";
+import { inferOn } from "./remote.js";
+import { record as dispatchRecord, meter as dispatchMeter, ESTIMATE_COSTS } from "./dispatch.js";
 
 // The tab posts its state every 5 s — but a hidden tab's timers are throttled
 // to about once a minute, so the bridge also pings over the open event stream
@@ -86,14 +88,37 @@ export function createBridge({
   lendModel = null,
   autoOpen = true, // try to open a controller tab ourselves when none is connected
   linksFile = DEFAULT_LINKS_FILE,
+  frontierExecutors = [], // discovered credentialed providers (discovery.js discoverAll); keys live on this machine
+  frontierFetch = fetch,
   log = () => {},
 } = {}) {
   const tabs = new Set(); // open SSE responses; the newest one is the controller
   let state = null; // last state the tab posted
   let stateAt = 0;
   const jobs = new Map(); // id -> { onMsg }
-  const stats = { fleet: 0, passthrough: 0, fellThrough: 0, native: 0 };
+  const stats = { fleet: 0, passthrough: 0, fellThrough: 0, native: 0, frontier: 0, frontierRefused: 0 };
   let links = loadLinks(linksFile); // native app servers linked by hand or the page
+
+  // Frontier executors (provider keys configured server-side — `heimdall key`,
+  // HEIMDALL_KEY_*). Each answers its model id and `provider:model`. They are
+  // SEALED-ONLY: a request reaches them only when the caller marks the body
+  // `heimdall_privacy: "sealed-external" | "explicit"` — never raw by default.
+  const frontierMap = new Map(); // served model name -> executor record
+  for (const ex of frontierExecutors || []) {
+    if (!ex?.model || !ex?.endpoint) continue;
+    for (const name of [ex.model, `${ex.provider}:${ex.model}`]) frontierMap.set(name, ex);
+  }
+  const isFrontier = (model) => !!model && frontierMap.has(model);
+  const frontierGate = (privacy) => privacy === "sealed-external" || privacy === "explicit";
+  const frontierRefusal = (model) => `frontier model ${model} is sealed-only — send heimdall_privacy:"sealed-external" (or "explicit") in the body; the Fold selects its privacy mode and seals first`;
+
+  // The dispatch ledger (dispatch.js): every frontier choice and its measured
+  // tokens, so /api/meter reports exact external tokens, never an estimate.
+  const dispatchLedger = [];
+  const recordDispatch = (job, selected, reason, actual, lane = null) => {
+    dispatchLedger.push(dispatchRecord({ job, selected, reason, actual, lane }));
+    if (dispatchLedger.length > 2000) dispatchLedger.splice(0, dispatchLedger.length - 2000);
+  };
   const selfOrigins = new Set([`http://localhost:${port}`, `http://127.0.0.1:${port}`]);
   // Any page on THIS box, any port, may use the bridge from a browser (a
   // caller like the-fold's app.js is served from its own port and needs a
@@ -138,7 +163,7 @@ export function createBridge({
   // models it advertised; a browser worker answers the WebLLM ids it holds.
   const linkedGiver = (model) => resolveLink(links, model);
   const fleetServes = (model) =>
-    !!model && (!!linkedGiver(model) || readyWorkers().some((w) => isAny(model) || answers(w.model, model)));
+    !!model && (isFrontier(model) || !!linkedGiver(model) || readyWorkers().some((w) => isAny(model) || answers(w.model, model)));
 
   function toTab(msg) {
     const tab = [...tabs].at(-1);
@@ -245,9 +270,30 @@ export function createBridge({
   /** One chat on whichever giver is best: a linked native app first (real
    *  GPU, survives without a controller tab), else the browser fleet. */
   function runOnGiver(model, opts, onToken) {
+    if (frontierMap.has(model)) return runOnFrontier(model, opts, onToken);
     const link = linkedGiver(model);
     if (link) return runOnLink(link, opts, onToken);
     return runOnFleet({ model, ...opts }, onToken);
+  }
+
+  /** One chat on a configured frontier executor (Anthropic/OpenAI/… wire via
+   *  remote.js inferOn). The caller has already passed the privacy gate; the
+   *  body sent upstream is exactly what the Fold put there (the projection for
+   *  its selected privacy mode). Every call lands a dispatch-ledger entry. */
+  async function runOnFrontier(model, { messages, temperature = 0.7, max_tokens = 1024 }, onToken) {
+    const ex = frontierMap.get(model);
+    const t0 = Date.now();
+    const out = await inferOn(ex, { messages, temperature, maxTokens: max_tokens, onToken, fetchImpl: frontierFetch });
+    stats.frontier++;
+    recordDispatch(
+      { id: "bridge-" + randomUUID(), taskClass: "bridge.frontier", privacy: "sealed-external" },
+      `${ex.provider}:${ex.model}`,
+      "frontier",
+      { ms: out.ms, inputTokens: 0, outputTokens: out.tokens },
+      "frontier",
+    );
+    log(`frontier  ${ex.provider}:${ex.model}  ${out.tokens} tokens  ${out.ms}ms`);
+    return out;
   }
 
   /* ---------------------------------------------------------- helpers */
@@ -456,6 +502,20 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
         });
       }
     }
+    // Configured frontier providers appear under `provider:model` (and the bare
+    // model id). Reachability is the executor's own live probe, never assumed.
+    for (const [name, ex] of frontierMap) {
+      if (seen.has(name)) continue;
+      seen.set(name, {
+        name,
+        model: name,
+        modified_at: new Date().toISOString(),
+        size: 0,
+        digest: "",
+        details: { parent_model: "", format: "frontier", family: ex.provider, families: [ex.provider], parameter_size: "", quantization_level: "" },
+        heimdall: { frontier: ex.provider, privacy: "sealed-external", location: ex.location ?? "external", context_window: null, queueDepth: 0 },
+      });
+    }
     return [...seen.values()];
   }
 
@@ -477,6 +537,11 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
   async function ollamaRun(req, res, raw, kind) {
     let b;
     try { b = JSON.parse(raw.toString() || "{}"); } catch { return json(res, 400, { error: "invalid JSON" }); }
+    const privacy = b.heimdall_privacy || b.privacy || null;
+    if (isFrontier(b.model) && !frontierGate(privacy)) {
+      stats.frontierRefused++;
+      return json(res, 400, { error: frontierRefusal(b.model) });
+    }
     const messages = chatMessagesOf(b);
     const hasPrompt = messages.some((m) => m.content.trim());
     // A load / keep-alive call (no prompt): answered at once when a phone holds the model.
@@ -535,6 +600,11 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
   async function openaiChat(req, res, raw) {
     let b;
     try { b = JSON.parse(raw.toString() || "{}"); } catch { return json(res, 400, { error: { message: "invalid JSON" } }); }
+    const privacy = b.heimdall_privacy || b.privacy || null;
+    if (isFrontier(b.model) && !frontierGate(privacy)) {
+      stats.frontierRefused++;
+      return json(res, 400, { error: { message: frontierRefusal(b.model) } });
+    }
     if (b.response_format || b.tools?.length || !fleetServes(b.model)) return pipeUpstream(req, res, raw);
     const messages = (b.messages || []).map((m) => ({ role: m.role, content: typeof m.content === "string" ? m.content : (m.content || []).map((p) => p.text || "").join("") }));
     const id = `chatcmpl-${randomUUID()}`;
@@ -565,6 +635,56 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
       if (e?.beforeFirstToken && !started) { stats.fellThrough++; return pipeUpstream(req, res, raw); }
       if (b.stream) { start(); res.end(`data: ${JSON.stringify({ error: { message: e?.message } })}\n\n`); }
       else json(res, 502, { error: { message: e?.message || "fleet error" } });
+    }
+  }
+
+  /* ---------------------------------------------- Anthropic: /v1/messages */
+
+  async function anthropicChat(req, res, raw) {
+    let b;
+    try { b = JSON.parse(raw.toString() || "{}"); } catch { return json(res, 400, { error: { type: "invalid_request_error", message: "invalid JSON" } }); }
+    const privacy = b.heimdall_privacy || b.privacy || null;
+    if (isFrontier(b.model) && !frontierGate(privacy)) {
+      stats.frontierRefused++;
+      return json(res, 400, { error: { type: "invalid_request_error", message: frontierRefusal(b.model) } });
+    }
+    if (!fleetServes(b.model)) return pipeUpstream(req, res, raw);
+    const messages = [];
+    if (b.system) messages.push({ role: "system", content: String(b.system) });
+    for (const m of b.messages || []) {
+      const content = typeof m.content === "string" ? m.content : (Array.isArray(m.content) ? m.content.map((p) => p.text || "").join("") : "");
+      messages.push({ role: m.role, content });
+    }
+    const id = `msg_${randomUUID()}`;
+    const stream = b.stream === true;
+    let started = false;
+    const start = () => {
+      if (started || !stream) return;
+      started = true;
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      res.write(`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id, type: "message", role: "assistant", model: b.model, content: [], stop_reason: null } })}\n\n`);
+    };
+    try {
+      const out = await runOnGiver(
+        b.model,
+        { messages, temperature: b.temperature ?? 0.7, max_tokens: b.max_tokens ?? 1024 },
+        (delta) => {
+          start();
+          if (stream) res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: delta } })}\n\n`);
+        },
+      );
+      if (stream) {
+        start();
+        res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`);
+        res.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: out.tokens } })}\n\n`);
+        res.end(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
+      } else {
+        json(res, 200, { id, type: "message", role: "assistant", model: b.model, content: [{ type: "text", text: out.text }], stop_reason: "end_turn", usage: { input_tokens: 0, output_tokens: out.tokens } });
+      }
+    } catch (e) {
+      if (e?.beforeFirstToken && !started) { stats.fellThrough++; return pipeUpstream(req, res, raw); }
+      if (stream) { start(); res.end(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: e?.message } })}\n\n`); }
+      else json(res, 502, { error: { type: "api_error", message: e?.message || "fleet error" } });
     }
   }
 
@@ -695,8 +815,21 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
           return ollamaRun(req, res, await readBody(req), "generate");
         case "POST /v1/chat/completions":
           return openaiChat(req, res, await readBody(req));
+        case "POST /v1/messages":
+          return anthropicChat(req, res, await readBody(req));
         case "GET /v1/models":
-          return json(res, 200, { object: "list", data: fleetModels().map((m) => ({ id: m.name, object: "model", owned_by: "heimdall-fleet" })) });
+          return json(res, 200, { object: "list", data: fleetModels().map((m) => ({ id: m.name, object: "model", owned_by: m.heimdall?.frontier ? "heimdall-frontier:" + m.heimdall.frontier : "heimdall-fleet" })) });
+        case "GET /api/ledger":
+          return json(res, 200, { entries: dispatchLedger.slice(-200) });
+        case "GET /api/meter":
+          return json(res, 200, dispatchMeter(dispatchLedger, ESTIMATE_COSTS));
+        case "GET /api/frontier": {
+          // Which frontier providers are configured on THIS machine and what
+          // they expose — model names and privacy class, never keys.
+          const providers = [];
+          for (const [name, ex] of frontierMap) providers.push({ model: name, provider: ex.provider, privacy: "sealed-external", reachable: !!ex.live?.reachable, endpoint: ex.endpoint });
+          return json(res, 200, { configured: frontierMap.size > 0, providers, keySource: "server-side (heimdall key / HEIMDALL_KEY_*), never a browser", gate: 'requests must carry heimdall_privacy:"sealed-external" (Fold privacy mode)' });
+        }
         default:
           if (u.pathname.startsWith("/api/") || u.pathname.startsWith("/v1/")) return pipeUpstream(req, res, await readBody(req));
           if (req.method === "GET") return serveStatic(req, res);

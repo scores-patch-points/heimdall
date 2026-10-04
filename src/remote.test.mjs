@@ -1,7 +1,7 @@
 // remote.test.mjs — the remote-lane client: wires, timing, and capacity signals.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chatOpenAI, chatOllama, inferOn } from "./remote.js";
+import { chatOpenAI, chatOllama, chatAnthropic, inferOn } from "./remote.js";
 
 /** Fake fetch with a controllable SSE stream for OpenAI wire. */
 function sseFetch({ status = 200, chunks = [], body = null, failWith = null } = {}) {
@@ -104,4 +104,68 @@ test("inferOn: a keyless local lane sends the call with no credential", async ()
   const out = await inferOn(exec, { fetchImpl: ff });
   assert.equal(out.text, "ok");
   assert.equal(sawAuth, null, "no credential was sent");
+});
+
+test("chatAnthropic: speaks the /v1/messages wire with x-api-key, system top-level", async () => {
+  let captured = null;
+  const ff = async (url, opts) => {
+    captured = { url, headers: opts.headers, body: JSON.parse(opts.body) };
+    return {
+      ok: true,
+      status: 200,
+      body: new ReadableStream({ start(c) { c.close(); } }),
+      json: async () => ({ content: [{ type: "text", text: "sealed" }], usage: { output_tokens: 6 } }),
+    };
+  };
+  const out = await chatAnthropic({
+    base: "https://api.anthropic.com/v1",
+    model: "claude-sonnet-4-20250514",
+    key: "sk-ant-test",
+    messages: [{ role: "system", content: "reason over the opaque structure" }, { role: "user", content: "Q?" }],
+    stream: false,
+    fetchImpl: ff,
+  });
+  assert.equal(out.text, "sealed");
+  assert.equal(out.tokens, 6);
+  assert.match(captured.url, /\/v1\/messages$/);
+  assert.equal(captured.headers["x-api-key"], "sk-ant-test");
+  assert.equal(captured.headers["anthropic-version"], "2023-06-01");
+  assert.equal(captured.body.system, "reason over the opaque structure");
+  assert.equal(captured.body.messages.length, 1);
+  assert.equal(captured.body.messages[0].role, "user");
+});
+
+test("chatAnthropic: streaming parses content_block_delta events", async () => {
+  const events = [
+    `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { content: [] } })}\n\n`,
+    `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "A" } })}\n\n`,
+    `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "B" } })}\n\n`,
+    `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+  ].join("");
+  const ff = async () => ({ ok: true, status: 200, body: new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(events)); c.close(); } }) });
+  const seen = [];
+  const out = await chatAnthropic({ base: "https://api.anthropic.com/v1", model: "m", key: "k", messages: [{ role: "user", content: "hi" }], onToken: (t) => seen.push(t), fetchImpl: ff });
+  assert.equal(out.text, "AB");
+  assert.equal(seen.join(""), "AB");
+  assert.equal(out.status, 200);
+});
+
+test("inferOn: provider anthropic sends on the Anthropic wire with its key", async () => {
+  let captured = null;
+  const ff = async (url, opts) => {
+    captured = { url, headers: opts.headers };
+    const data = `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", delta: { type: "text_delta", text: "x" } })}\n\nevent: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`;
+    return { ok: true, status: 200, body: new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(data)); c.close(); } }) };
+  };
+  const exec = {
+    provider: "anthropic",
+    authClass: "api_key",
+    auth: { kind: "api_key", apiKey: "sk-ant-xyz" },
+    endpoint: "https://api.anthropic.com/v1",
+    model: "claude-sonnet-4-20250514",
+  };
+  const out = await inferOn(exec, { messages: [{ role: "user", content: "hi" }], fetchImpl: ff });
+  assert.equal(out.text, "x");
+  assert.match(captured.url, /\/v1\/messages$/);
+  assert.equal(captured.headers["x-api-key"], "sk-ant-xyz");
 });

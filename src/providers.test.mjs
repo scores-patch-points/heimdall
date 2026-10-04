@@ -1,7 +1,7 @@
 // providers.test.mjs — the self-healing catalog and its live/probe transitions.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { PROVIDER_CATALOG, makeProviderRecord, isLiveDiscovered, catalogFor, LEGITIMATE_SOURCES } from "./providers.js";
+import { PROVIDER_CATALOG, makeProviderRecord, isLiveDiscovered, catalogFor, LEGITIMATE_SOURCES, loadProviderKeys } from "./providers.js";
 
 test("the catalog seeds the keyless lanes explicitly", () => {
   const providers = PROVIDER_CATALOG.map((p) => p.provider);
@@ -50,4 +50,19 @@ test("legitimate sources are declared; random internet servers are not among the
 test("unknown providers return null", () => {
   assert.equal(catalogFor("totally-made-up"), null);
   assert.equal(makeProviderRecord("totally-made-up"), null);
+});
+
+test("loadProviderKeys merges env HEIMDALL_KEY_* and stored state, lowercased", () => {
+  const env = { HEIMDALL_KEY_GROQ: "sk-g", HEIMDALL_KEY_OPENROUTER: "sk-or", HOME: "/x", NOPE: "n" };
+  const state = { providerKeys: { anthropic: "sk-a" } };
+  const providers = loadProviderKeys({ env, state });
+  assert.deepEqual(providers, {
+    groq: { key: "sk-g" },
+    openrouter: { key: "sk-or" },
+    anthropic: { key: "sk-a" },
+  });
+});
+
+test("loadProviderKeys is empty with nothing configured", () => {
+  assert.deepEqual(loadProviderKeys({ env: { HOME: "/x" }, state: {} }), {});
 });

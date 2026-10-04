@@ -87,6 +87,25 @@ export function catalogFor(providerName) {
   return PROVIDER_CATALOG.find((p) => p.provider === providerName) ?? null;
 }
 
+/** The configured provider keys, merged from env (`HEIMDALL_KEY_<PROVIDER>`)
+ *  and the CLI's stored `state.providerKeys` (keys are entered on this
+ *  machine and never reach a browser). Pure; returns { provider: { key } }. */
+export function loadProviderKeys({ env = process.env, state = {} } = {}) {
+  const providers = {};
+  for (const [name, val] of Object.entries(env)) {
+    const m = /^HEIMDALL_KEY_([A-Z0-9_]+)$/.exec(name);
+    if (m && val) providers[m[1].toLowerCase()] = { key: val };
+  }
+  // `heimdall key` stores bare strings; discovery expects { key }. Normalize
+  // both shapes so a stored key is never silently dropped (the pre-2026-10-04
+  // `discover` bug: Object.assign passed strings straight through).
+  for (const [name, val] of Object.entries(state.providerKeys || {})) {
+    if (typeof val === "string" && val) providers[name] = { key: val };
+    else if (val && typeof val === "object" && val.key) providers[name] = { key: val.key };
+  }
+  return providers;
+}
+
 export function endpointFor(providerName) {
   return PROVIDER_ENDPOINTS[providerName] ?? null;
 }

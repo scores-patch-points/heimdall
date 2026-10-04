@@ -93,13 +93,9 @@ if (cmd === "login") {
   // the same on load (plus the browser-only lanes: WebLLM, Transformers,
   // Puter); this command is the headless view of the same inventory.
   const { discoverAll } = await import("../src/discovery.js");
+  const { loadProviderKeys } = await import("../src/providers.js");
   const state = load();
-  const providers = {};
-  for (const [name, val] of Object.entries(process.env)) {
-    const m = /^HEIMDALL_KEY_([A-Z0-9_]+)$/.exec(name);
-    if (m && val) providers[m[1].toLowerCase()] = { key: val };
-  }
-  if (state.providerKeys) Object.assign(providers, state.providerKeys);
+  const providers = loadProviderKeys({ state });
   const endpoints = (state.endpoints || []).filter((e) => e?.url);
   const execs = await discoverAll({ config: { providers, endpoints } });
   console.log("HEIMDALL DISCOVERY");
@@ -153,6 +149,47 @@ if (cmd === "login") {
   console.log(`models  ${probe.models.join(", ") || "(none reported)"}`);
   console.log(`serves  ${tag}`);
   console.log(`saved   ${DEFAULT_LINKS_FILE}  (${links.length} link${links.length === 1 ? "" : "s"})`);
+} else if (cmd === "key") {
+  // Frontier-provider API keys live HERE, on the heimdall machine, never in a
+  // browser page. `heimdall key anthropic sk-…` writes state.providerKeys; the
+  // discovery boot (heimdall discover / the bridge) merges these with the
+  // HEIMDALL_KEY_<PROVIDER> env vars. Keys are never echoed back.
+  const { catalogFor } = await import("../src/providers.js");
+  const state = load();
+  const providers = state.providerKeys || (state.providerKeys = {});
+  const rm = args.includes("--rm");
+  const provider = args[1] === "--rm" ? args[2] : args[1];
+  const keyArg = args[1] === "--rm" ? args[3] : args[2];
+  if (!provider) {
+    const rows = Object.entries(providers);
+    console.log(rows.length ? "CONFIGURED PROVIDER KEYS (stored in " + STATE + ")" : "NO PROVIDER KEYS STORED");
+    for (const [p, k] of rows) console.log("  " + p + "  " + (k ? "set (" + k.length + " chars)" : "set"));
+    console.log("");
+    console.log("set:   heimdall key <provider> <key>     (e.g. heimdall key anthropic sk-ant-…)");
+    console.log("remove: heimdall key --rm <provider>");
+    console.log("env:   HEIMDALL_KEY_<PROVIDER> also counts (no storage needed).");
+    process.exit(0);
+  }
+  const known = catalogFor(provider);
+  if (!known) {
+    console.error("unknown provider \"" + provider + "\" — known: openrouter groq mistral cohere google cloudflare huggingface openai anthropic together cerebras (and the local lanes)");
+    process.exit(1);
+  }
+  if (rm) {
+    delete providers[provider];
+    save(state);
+    console.log(`removed provider key for ${provider}`);
+    process.exit(0);
+  }
+  if (keyArg) {
+    providers[provider] = keyArg;
+    save(state);
+    console.log(`stored provider key for ${provider} (${keyArg.length} chars) in ${STATE}`);
+    console.log("the bridge and discovery read it from here; nothing about it reaches a browser.");
+    process.exit(0);
+  }
+  if (providers[provider]) console.log(`${provider}: set (${providers[provider].length} chars) — ${known.base || "custom base"} — ${known.trust}`);
+  else console.log(`${provider}: not set`);
 } else if (cmd === "reset") {
   save({});
   console.log("stored session cleared");
@@ -164,6 +201,8 @@ if (cmd === "login") {
   console.log("  heimdall up      run the fleet on this computer: page + Ollama-compatible bridge");
   console.log("                   [--port 8790] [--no-open] [--no-passthrough] [--lend <ollama model>|none]");
   console.log("  heimdall discover  probe localhost + configured providers, report auth observations");
+  console.log("  heimdall key       store/remove frontier provider API keys for THIS machine (server-side, never in a browser)");
+  console.log("                     heimdall key <provider> <key>  ·  heimdall key --rm <provider>  ·  heimdall key (list)");
   console.log("  heimdall invite  [--name \"Your Name\"] [--room !id:hs] [--new] [--hs URL]");
   console.log("                   [--user @me:hs --password …]");
   console.log("  heimdall link    <host:port> [--tag gemma2:2b] [--model ID] [--key TOKEN] [--name phone]");
@@ -246,6 +285,22 @@ async function up() {
   const lendModel = lendFlag === "none" ? null
     : preferred.find((m) => installed.includes(m)) ?? installed.find((m) => !/embed/i.test(m)) ?? null;
 
+  // Frontier providers configured on THIS machine (`heimdall key` + the
+  // HEIMDALL_KEY_* env) — discovered once at boot and lent to the bridge as
+  // sealed-only executors. The keys never reach a browser. A provider whose
+  // probe failed is not offered: reachable is measured, never assumed.
+  let frontierExecutors = [];
+  try {
+    const { discoverAll } = await import("../src/discovery.js");
+    const { loadProviderKeys } = await import("../src/providers.js");
+    const keyState = load();
+    const discovered = await discoverAll({ config: { providers: loadProviderKeys({ state: keyState }) } });
+    frontierExecutors = discovered.filter((r) => r.live?.reachable && r.location === "external" && r.model && r.endpoint);
+    if (frontierExecutors.length) console.log("  remote lane        " + frontierExecutors.map((r) => `${r.provider}:${r.model}`).join(", ") + "  (sealed-external only)");
+  } catch (e) {
+    console.log("  remote lane        discovery failed: " + e.message);
+  }
+
   const bridge = createBridge({
     port,
     dist,
@@ -254,6 +309,7 @@ async function up() {
     lendModel,
     autoOpen: !noOpen,
     site: process.env.HEIMDALL_SITE || SITE,
+    frontierExecutors,
     log: (line) => console.log(new Date().toISOString().slice(11, 19) + "  " + line),
   });
   try {

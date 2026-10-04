@@ -150,6 +150,70 @@ export async function chatPuter({ model, messages = [], temperature = 0.7, maxTo
   }
 }
 
+/** One completion on the Anthropic Messages lane (/v1/messages). Anthropic
+ *  carries the system prompt in a top-level `system` field (never a message),
+ *  authenticates with `x-api-key` + `anthropic-version`, and returns text in
+ *  `content[].text`. Same { text, ms, ttft, tokens, status } shape as the
+ *  other lanes, so executors.js learns capacity identically. Streaming parses
+ *  the `content_block_delta` events. */
+export async function chatAnthropic({ base, model, key = null, messages = [], temperature = 0.7, maxTokens = 1024, stream = true, onToken = null, fetchImpl = fetch, timeoutMs = 120_000 } = {}) {
+  const url = `${String(base).replace(/\/+$/, "")}/v1/messages`;
+  const headers = { "content-type": "application/json", "anthropic-version": "2023-06-01" };
+  if (key) headers["x-api-key"] = key;
+  const system = messages.filter((m) => m.role === "system").map((m) => String(m.content ?? "")).join("\n\n") || undefined;
+  const body = { model, max_tokens: maxTokens, temperature, ...(system ? { system } : {}), messages: messages.filter((m) => m.role !== "system").map((m) => ({ role: m.role, content: String(m.content ?? "") })), stream };
+  const t0 = Date.now();
+  let ttft = null;
+  let text = "";
+  let tokens = 0;
+  let buf = "";
+  let status = null;
+  try {
+    const r = await fetchImpl(url, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
+    status = r.status;
+    if (r.status === 429) return { text, ms: Date.now() - t0, ttft, tokens, status: 429, note: "rate-limited" };
+    if (r.status >= 500) return { text, ms: Date.now() - t0, ttft, tokens, status: r.status, note: `provider ${r.status}` };
+    if (!r.ok || !r.body) {
+      const errText = await r.text().catch(() => "");
+      throw Object.assign(new Error(`${status}: ${errText.slice(0, 200)}`), { status, timedOut: false });
+    }
+    if (!stream) {
+      const j = await r.json();
+      text = (j.content ?? []).map((c) => c.text ?? "").join("");
+      ttft = Date.now() - t0;
+      return { text, ms: Date.now() - t0, ttft, tokens: j.usage?.output_tokens ?? 0, status: 200 };
+    }
+    const reader = r.body.pipeThrough(new TextDecoderStream()).getReader();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += value;
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).replace(/\r$/, "").trim();
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        let j;
+        try { j = JSON.parse(payload); } catch { continue; }
+        if (ttft == null) ttft = Date.now() - t0;
+        const delta = j.type === "content_block_delta" ? j.delta?.text : null;
+        if (typeof delta === "string" && delta) {
+          text += delta;
+          tokens++;
+          onToken?.(delta);
+        }
+      }
+    }
+    return { text, ms: Date.now() - t0, ttft: ttft ?? Date.now() - t0, tokens, status: 200 };
+  } catch (e) {
+    const timedOut = e?.name === "TimeoutError" || /timed out|AbortError/i.test(String(e?.message || e?.name || ""));
+    const err = Object.assign(new Error(e?.message || "anthropic lane error"), { status, timedOut, beforeFirstToken: tokens === 0 });
+    throw err;
+  }
+}
+
 /** Dispatch one job to an executor record, on the wire its provider speaks.
  *  Returns the chat result; throws with { timedOut, status, beforeFirstToken }
  *  on failure so executors.js can learn capacity. */
@@ -161,6 +225,8 @@ export async function inferOn(exec, { messages = [], temperature = 0.7, maxToken
       return chatPuter({ model: exec.model, messages, temperature, maxTokens, onToken });
     case "ollama":
       return chatOllama({ base: exec.endpoint, model: exec.model, key, messages, temperature, maxTokens, onToken, fetchImpl });
+    case "anthropic":
+      return chatAnthropic({ base: exec.endpoint, model: exec.model, key, messages, temperature, maxTokens, onToken, fetchImpl });
     default:
       if (exec.authClass === "api_key" && !key) {
         const err = new Error("api_key lane without a configured key");

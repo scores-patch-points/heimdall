@@ -17,8 +17,11 @@ export const LANE_KIND = Object.freeze({
 });
 
 /** One ledger entry. `selected`, `candidates`, and `actual` mirror the design:
- *  candidates carries the predicted E[T_accepted] per eligible lane. */
-export function record({ job, selected, reason, candidates = [], actual = null }) {
+ *  candidates carries the predicted E[T_accepted] per eligible lane. `lane`
+ *  (optional) pins the lane kind explicitly — a selected id that the name
+ *  regex would misclassify (e.g. "groq:…" is open remote, "anthropic:…" is
+ *  frontier) is tagged by the caller who knows the truth. */
+export function record({ job, selected, reason, candidates = [], actual = null, lane = null }) {
   return {
     job: job.id,
     taskClass: job.taskClass,
@@ -26,6 +29,7 @@ export function record({ job, selected, reason, candidates = [], actual = null }
     selected,
     reason,
     candidates,
+    ...(lane ? { _lane: lane } : {}),
     actual: actual
       ? { ms: actual.ms ?? null, inputTokens: actual.inputTokens ?? 0, outputTokens: actual.outputTokens ?? 0, accepted: actual.accepted ?? true }
       : null,
