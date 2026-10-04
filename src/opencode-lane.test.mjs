@@ -63,6 +63,17 @@ test("code creates a session then prompts it, end to end", async () => {
   assert.deepEqual(calls.map((c) => c.method + " " + c.path), ["POST /session", "POST /session/ses_1/message"]);
 });
 
+test("code binds a new session to the project folder via directory (the shared project)", async () => {
+  const { fetchImpl, calls } = fakeOpenCode();
+  await code(DEFAULT_OPENCODE, { prompt: "edit the project", cwd: "/Users/me/proj" }, { fetchImpl });
+  const create = calls.find((c) => c.path === "/session");
+  assert.equal(create.body.directory, "/Users/me/proj", "the folder rides session create");
+  // Continuing an existing session must NOT re-send a directory.
+  const { fetchImpl: f2, calls: c2 } = fakeOpenCode();
+  await code(DEFAULT_OPENCODE, { prompt: "again", sessionId: "ses_9", cwd: "/Users/me/proj" }, { fetchImpl: f2 });
+  assert.ok(!c2.some((c) => c.path === "/session"), "no new session is created when continuing");
+});
+
 test("a failing prompt throws with the server message", async () => {
   const fetchImpl = async (url, opts) => {
     if (opts.method === "POST" && String(url).endsWith("/session")) return { ok: true, status: 200, text: async () => JSON.stringify({ id: "s" }) };

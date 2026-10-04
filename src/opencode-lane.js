@@ -55,11 +55,16 @@ async function readJson(r) {
 
 /** Create a session. `create` = { title?, agent?, model?, directory? }.
  *  Returns { id, raw }. */
-export async function createSession(base, { title = null, agent = null, model = null } = {}, { fetchImpl = fetch, timeoutMs = 15000 } = {}) {
+export async function createSession(base, { title = null, agent = null, model = null, directory = null } = {}, { fetchImpl = fetch, timeoutMs = 15000 } = {}) {
   const body = {};
   if (title) body.title = title;
   if (agent) body.agent = agent;
   if (model) body.model = model;
+  // `directory` binds the session to a project folder. The conductor reads the
+  // seeds its own workspace unless told otherwise; a raw opencode server uses
+  // it as the working directory. Sent only when given, so the default is
+  // unchanged.
+  if (directory) body.directory = directory;
   const r = await fetchImpl(opencodeBase(base) + "/session", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
   if (!r.ok) throw new Error("opencode session " + r.status + ": " + (await r.text().catch(() => "")).slice(0, 200));
   const j = await readJson(r);
@@ -93,13 +98,14 @@ export async function messages(base, sessionID, { fetchImpl = fetch, limit = 50,
  *  iterates via the record — the opencode session is the EOT ledger for code),
  *  prompt it, return what it did. `sessionId` continues an existing session:
  *  the same session id means the next turn builds on the retained record. */
-export async function code(base, { prompt: text, title = null, model = null, agent = null, system = null, sessionId = null } = {}, { fetchImpl = fetch, timeoutMs = 300000 } = {}) {
+export async function code(base, { prompt: text, title = null, model = null, agent = null, system = null, sessionId = null, cwd = null } = {}, { fetchImpl = fetch, timeoutMs = 300000 } = {}) {
   const t0 = Date.now();
   // Create the session WITHOUT a model (CreateInput.model is a different
   // shape and rejects a ModelRef); the model rides the prompt, where
   // PromptInput.model is the ModelRef the server expects. When a sessionId is
-  // given, continue that session — iteration via the EOT ledger.
-  const id = sessionId || (await createSession(base, { title: title || "fold code" }, { fetchImpl })).id;
+  // given, continue that session — iteration via the EOT ledger. `cwd` binds a
+  // NEW session to the project's folder (ignored when continuing).
+  const id = sessionId || (await createSession(base, { title: title || "fold code", directory: cwd || null }, { fetchImpl })).id;
   const out = await prompt(base, id, text, { model, agent, system }, { fetchImpl, timeoutMs });
   return { sessionId: id, text: out.text, activity: out.activity, ms: Date.now() - t0, iterated: !!sessionId };
 }

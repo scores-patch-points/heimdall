@@ -930,7 +930,11 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
           if (!b || typeof b.prompt !== "string" || !b.prompt.trim()) return json(res, 400, { error: "body needs { prompt }" });
           const t0 = Date.now();
           try {
-            const out = await opencodeCode(opencodeUrl, { prompt: b.prompt, title: b.title || null, model: b.model || null, agent: b.agent || null, system: b.system || null, sessionId: b.sessionId || null }, { fetchImpl: opencodeFetch });
+            // `cwd` binds the job to the project's folder: when the door is the
+            // conductor it reads/edits that directory; when it is a raw opencode
+            // server the wire ignores it. Either way the model's own calls route
+            // back through this bridge's /v1.
+            const out = await opencodeCode(opencodeUrl, { prompt: b.prompt, title: b.title || null, model: b.model || null, agent: b.agent || null, system: b.system || null, sessionId: b.sessionId || null, cwd: b.cwd || null }, { fetchImpl: opencodeFetch });
             stats.code++;
             recordDispatch(
               { id: "code-" + randomUUID(), taskClass: "code.repair", privacy: "local-raw" },
