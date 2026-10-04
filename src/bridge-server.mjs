@@ -96,8 +96,8 @@ function defaultOpencodeFetch(url, init = {}) {
 // reads and writes the SAME file so a key entered through the surface lands
 // exactly where the CLI puts it — on this machine, never in a browser.
 const STATE_FILE = path.join(os.homedir(), ".heimdall", "state.json");
-function readState() { try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")) || {}; } catch (e) { return {}; } }
-function writeState(s) { fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true }); fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); }
+function readState(file = STATE_FILE) { try { return JSON.parse(fs.readFileSync(file, "utf8")) || {}; } catch (e) { return {}; } }
+function writeState(s, file = STATE_FILE) { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify(s, null, 2)); }
 const LOOPBACK_ADDR = /^(127\.\d+\.\d+\.\d+|::1|::ffff:127\.\d+\.\d+\.\d+)$/;
 
 export function createBridge({
@@ -112,6 +112,7 @@ export function createBridge({
   linksFile = DEFAULT_LINKS_FILE,
   frontierExecutors = [], // discovered credentialed providers (discovery.js discoverAll); keys live on this machine
   allowedOrigins = [], // extra page origins allowed to talk to the bridge (e.g. the fold's GitHub Pages origin); never "*"
+  stateFile = STATE_FILE, // where `heimdall key` stores providerKeys (injectable for tests)
   frontierFetch = fetch,
   opencodeUrl = process.env.HEIMDALL_OPENCODE || process.env.OPENCODE_URL || null, // a running `opencode serve` — the machine door for coding
   opencodeFetch = defaultOpencodeFetch,
@@ -141,7 +142,7 @@ export function createBridge({
     try {
       const { discoverAll } = await import("./discovery.js");
       const { loadProviderKeys } = await import("./providers.js");
-      const keys = loadProviderKeys({ state: readState() });
+      const keys = loadProviderKeys({ state: readState(stateFile) });
       const discovered = await discoverAll({ config: { providers: keys } }, { fetchImpl: frontierFetch });
       const next = new Map();
       let n = 0;
@@ -889,7 +890,7 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
         }
         case "GET /api/providers/keys": {
           // Which providers have a key set — names only, never the key values.
-          const stored = readState().providerKeys || {};
+          const stored = readState(stateFile).providerKeys || {};
           return json(res, 200, { providers: Object.keys(stored).map((p) => ({ provider: p, set: true })), keySource: "server-side (never a browser)" });
         }
         case "POST /api/providers/keys": {
@@ -905,12 +906,12 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
           const provider = String(b.provider || "").toLowerCase();
           const { catalogFor } = await import("./providers.js");
           if (!catalogFor(provider)) return json(res, 400, { error: `unknown provider "${provider}"` });
-          const st = readState();
+          const st = readState(stateFile);
           st.providerKeys = st.providerKeys || {};
           if (b.remove) delete st.providerKeys[provider];
           else if (typeof b.key === "string" && b.key.trim()) st.providerKeys[provider] = b.key.trim();
           else return json(res, 400, { error: "body needs { provider, key } or { provider, remove: true }" });
-          writeState(st);
+          writeState(st, stateFile);
           const models = await refreshFrontier();
           log(`provider key ${b.remove ? "removed" : "stored"} for ${provider} (server-side; ${models < 0 ? "discovery failed" : models + " model(s) reachable"})`);
           return json(res, 200, { ok: true, provider, stored: !b.remove, configured: Object.keys(st.providerKeys), frontierModels: models, keySource: "server-side (never a browser)" });

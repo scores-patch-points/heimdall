@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { createBridge } from "./bridge-server.mjs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { readFileSync } from "node:fs";
 
 /** Fake frontier upstream: captures the request, streams an OpenAI-style SSE reply. */
 function fakeUpstream({ key = null } = {}) {
@@ -137,6 +138,65 @@ test("bridge: /v1/messages (Anthropic wire) serves a frontier model under a seal
     assert.equal(j.content[0].text, "sealed-ok");
     assert.equal(seen[0].headers["x-api-key"], "sk-ant-t");
     assert.match(seen[0].url, /\/v1\/messages$/);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test("bridge: POST /api/providers/keys stores a key server-side and never echoes it", async () => {
+  const stateFile = join(tmpdir(), "heimdall-keys-test-" + Date.now() + "-" + Math.random().toString(36).slice(2) + ".json");
+  const ff = async () => ({ ok: false, status: 0, json: async () => ({}) }); // discovery finds nothing; the route still stores
+  const linksFile = join(tmpdir(), "bridge-keys-test-hosts-" + Date.now() + ".json");
+  const bridge = createBridge({ port: 0, host: "127.0.0.1", dist: tmpdir(), upstream: "http://127.0.0.1:1", frontierExecutors: [], frontierFetch: ff, linksFile, stateFile });
+  const addr = await bridge.listen();
+  try {
+    const base = `http://127.0.0.1:${addr.port}`;
+    const r = await post(base, "/api/providers/keys", { provider: "anthropic", key: "sk-ant-secret" });
+    assert.equal(r.status, 200);
+    const j = await r.json();
+    assert.equal(j.ok, true);
+    assert.equal(j.stored, true);
+    assert.deepEqual(j.configured, ["anthropic"]);
+    assert.equal(JSON.stringify(j).includes("sk-ant-secret"), false, "the key is never echoed");
+    // It landed in the same file the CLI uses.
+    const disk = JSON.parse(readFileSync(stateFile, "utf8"));
+    assert.equal(disk.providerKeys.anthropic, "sk-ant-secret");
+    // The list route reports names only.
+    const list = await (await fetch(base + "/api/providers/keys")).json();
+    assert.deepEqual(list.providers, [{ provider: "anthropic", set: true }]);
+    assert.equal(JSON.stringify(list).includes("sk-ant-secret"), false);
+    // Removal clears it.
+    const rm = await post(base, "/api/providers/keys", { provider: "anthropic", remove: true });
+    assert.deepEqual((await rm.json()).configured, []);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test("bridge: POST /api/providers/keys refuses an unknown provider", async () => {
+  const stateFile = join(tmpdir(), "heimdall-keys-test2-" + Date.now() + ".json");
+  const bridge = createBridge({ port: 0, host: "127.0.0.1", dist: tmpdir(), upstream: "http://127.0.0.1:1", linksFile: join(tmpdir(), "h2-" + Date.now() + ".json"), stateFile });
+  const addr = await bridge.listen();
+  try {
+    const r = await post(`http://127.0.0.1:${addr.port}`, "/api/providers/keys", { provider: "notathing", key: "x" });
+    assert.equal(r.status, 400);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test("bridge: an allowlisted page origin is reflected; an unknown one is refused", async () => {
+  const stateFile = join(tmpdir(), "heimdall-origins-test-" + Date.now() + ".json");
+  const pages = "https://scores-patch-points.github.io";
+  const bridge = createBridge({ port: 0, host: "127.0.0.1", dist: tmpdir(), upstream: "http://127.0.0.1:1", linksFile: join(tmpdir(), "h3-" + Date.now() + ".json"), stateFile, allowedOrigins: [pages] });
+  const addr = await bridge.listen();
+  try {
+    const base = `http://127.0.0.1:${addr.port}`;
+    const ok = await fetch(base + "/api/tags", { headers: { origin: pages } });
+    assert.equal(ok.status, 200);
+    assert.equal(ok.headers.get("access-control-allow-origin"), pages);
+    const bad = await fetch(base + "/api/tags", { headers: { origin: "https://evil.example" } });
+    assert.equal(bad.status, 403);
   } finally {
     await bridge.close();
   }
