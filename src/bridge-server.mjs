@@ -44,6 +44,7 @@ import {
 } from "./links.mjs";
 import { inferOn } from "./remote.js";
 import { record as dispatchRecord, meter as dispatchMeter, ESTIMATE_COSTS } from "./dispatch.js";
+import { code as opencodeCode } from "./opencode-lane.js";
 
 // The tab posts its state every 5 s — but a hidden tab's timers are throttled
 // to about once a minute, so the bridge also pings over the open event stream
@@ -90,13 +91,15 @@ export function createBridge({
   linksFile = DEFAULT_LINKS_FILE,
   frontierExecutors = [], // discovered credentialed providers (discovery.js discoverAll); keys live on this machine
   frontierFetch = fetch,
+  opencodeUrl = process.env.HEIMDALL_OPENCODE || process.env.OPENCODE_URL || null, // a running `opencode serve` — the machine door for coding
+  opencodeFetch = fetch,
   log = () => {},
 } = {}) {
   const tabs = new Set(); // open SSE responses; the newest one is the controller
   let state = null; // last state the tab posted
   let stateAt = 0;
   const jobs = new Map(); // id -> { onMsg }
-  const stats = { fleet: 0, passthrough: 0, fellThrough: 0, native: 0, frontier: 0, frontierRefused: 0 };
+  const stats = { fleet: 0, passthrough: 0, fellThrough: 0, native: 0, frontier: 0, frontierRefused: 0, code: 0 };
   let links = loadLinks(linksFile); // native app servers linked by hand or the page
 
   // Frontier executors (provider keys configured server-side — `heimdall key`,
@@ -829,6 +832,35 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
           const providers = [];
           for (const [name, ex] of frontierMap) providers.push({ model: name, provider: ex.provider, privacy: "sealed-external", reachable: !!ex.live?.reachable, endpoint: ex.endpoint });
           return json(res, 200, { configured: frontierMap.size > 0, providers, keySource: "server-side (heimdall key / HEIMDALL_KEY_*), never a browser", gate: 'requests must carry heimdall_privacy:"sealed-external" (Fold privacy mode)' });
+        }
+        case "GET /api/code/status":
+          return json(res, 200, { configured: !!opencodeUrl, url: opencodeUrl, note: "the machine door: coding runs on this machine's opencode server, routed through heimdall" });
+        case "POST /api/code": {
+          // The coding lane, through heimdall. A coding job is agentic file
+          // and shell work on THIS machine, so it runs on the local opencode
+          // server (a machine organ inside the trust domain) — never an
+          // outside executor. The MODEL opencode reasons with is itself
+          // routed by heimdall when opencode points at this bridge's /v1, so
+          // the best/safest/cheapest rule still holds one level down.
+          if (!opencodeUrl) return json(res, 501, { error: "no coding machine attached — run `opencode serve` and set HEIMDALL_OPENCODE (or OPENCODE_URL), then heimdall up" });
+          const b = JSON.parse((await readBody(req)).toString() || "{}");
+          if (!b || typeof b.prompt !== "string" || !b.prompt.trim()) return json(res, 400, { error: "body needs { prompt }" });
+          const t0 = Date.now();
+          try {
+            const out = await opencodeCode(opencodeUrl, { prompt: b.prompt, title: b.title || null, model: b.model || null, agent: b.agent || null, system: b.system || null }, { fetchImpl: opencodeFetch });
+            stats.code++;
+            recordDispatch(
+              { id: "code-" + randomUUID(), taskClass: "code.repair", privacy: "local-raw" },
+              "opencode:" + (out.sessionId || "session"),
+              "machine-door",
+              { ms: out.ms, inputTokens: 0, outputTokens: 0, accepted: !!out.text },
+              "deterministic/local",
+            );
+            log(`code  opencode  ${out.activity.length} tool step(s)  ${out.ms}ms`);
+            return json(res, 200, { sessionId: out.sessionId, text: out.text, activity: out.activity, ms: out.ms, lane: "opencode" });
+          } catch (e) {
+            return json(res, 502, { error: "opencode did not answer: " + String(e?.message || e) });
+          }
         }
         default:
           if (u.pathname.startsWith("/api/") || u.pathname.startsWith("/v1/")) return pipeUpstream(req, res, await readBody(req));
