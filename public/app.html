@@ -1,0 +1,58 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Join this heimdall fleet</title>
+<style>
+  :root{color-scheme:dark light}
+  body{font:16px/1.55 system-ui,sans-serif;max-width:640px;margin:1.5rem auto;padding:0 1rem}
+  h1{font-size:1.5rem} h2{font-size:1.05rem;margin-top:1.5rem}
+  .card{border:1px solid #8884;border-radius:12px;padding:1rem;margin:.6rem 0}
+  a.btn{display:inline-block;margin:.3rem .4rem .3rem 0;padding:.7rem 1rem;border:1px solid #8886;border-radius:10px;text-decoration:none;color:inherit;font-weight:600}
+  a.btn.hot{border-color:#4ea1ff;box-shadow:0 0 0 1px #4ea1ff}
+  a.ghost{opacity:.85;font-weight:400}
+  code{background:#8882;padding:.1rem .35rem;border-radius:5px}
+  .n{opacity:.7;font-size:.9em}
+</style>
+
+<h1>Join this heimdall fleet</h1>
+<p>Run the model on your phone's <b>real GPU</b> with a native app — more reliable
+than a browser, and it works on your Wi-Fi or over Tailscale across networks.</p>
+
+<h2>1. Install the app</h2>
+<div class="card">
+  <div data-os="ios"><b>iOS</b><br>
+    <a class="btn" data-os="ios" href="https://apps.apple.com/us/app/on-device-llm/id6770114399">OnDevice LLM</a>
+  </div>
+  <div data-os="android" style="margin-top:.4rem"><b>Android</b><br>
+    <a class="btn" data-os="android" href="https://play.google.com/store/apps/details?id=com.micklab.llama">LLM AI Server with llama.cpp</a>
+    <a class="btn" data-os="android" href="https://play.google.com/store/apps/details?id=com.llmproxy">Ollama Local AI — Phone IDE</a>
+  </div>
+  <div data-os="other" class="n">Open this page on your phone to see the right app.</div>
+</div>
+
+<h2>2. Start its server</h2>
+<div class="card">In the app, download a model and start the local API server.
+It shows an address like <code>http://100.64.0.7:8000</code> (Tailscale) or
+<code>http://192.168.1.50:8080</code> (Wi-Fi). Keep the app open — phones pause a
+background server.</div>
+
+<h2>3. Link it on the computer</h2>
+<div class="card">On the computer running heimdall, open
+<code>http://localhost:8790/link</code>, paste the address the app shows, and
+tap <b>Test &amp; add</b>. The phone is now a host behind your fleet.</div>
+
+<p><a class="btn ghost" id="browser">No app? Continue in the browser instead</a></p>
+
+<script>
+  (function () {
+    var ua = navigator.userAgent;
+    var os = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+      ? "ios" : (/Android/i.test(ua) ? "android" : "other");
+    document.querySelectorAll("[data-os]").forEach(function (el) {
+      if (el.classList.contains("btn") && el.dataset.os === os) el.classList.add("hot");
+      if (!el.classList.contains("btn")) el.style.display = el.dataset.os === os ? "" : "none";
+    });
+    // Keep the invite's room/hs params when someone chooses the browser path.
+    document.getElementById("browser").href = "./" + (location.search || "");
+  })();
+</script>

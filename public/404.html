@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>heimdall</title>
+  </head>
+  <body>
+    <script>
+      // GitHub Pages serves this page for any unknown path, so a short invite
+      // can be typed WITHOUT the query string:  /heimdall/<code>  becomes
+      // /heimdall/?r=<code>. A path that is not a short code goes home.
+      var m = location.pathname.match(/\/([a-z0-9]{3,8})\/?$/i);
+      location.replace("./" + (m ? "?r=" + m[1].toLowerCase() : ""));
+    </script>
+  </body>
+</html>
