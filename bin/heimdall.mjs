@@ -87,6 +87,51 @@ if (cmd === "login") {
   console.log("the 6-digit pairing code lives on the WORKER's device (its key fingerprint) —");
   console.log("have them read it to you, then Record it in the controller site (or fold).");
   console.log("keep the controller site open and signed into " + creds.userId + " so codes can be confirmed.");
+} else if (cmd === "discover") {
+  // Heimdall's boot sequence: probe the localhost lanes and the configured
+  // providers, report every endpoint with its auth observation. The page does
+  // the same on load (plus the browser-only lanes: WebLLM, Transformers,
+  // Puter); this command is the headless view of the same inventory.
+  const { discoverAll } = await import("../src/discovery.js");
+  const state = load();
+  const providers = {};
+  for (const [name, val] of Object.entries(process.env)) {
+    const m = /^HEIMDALL_KEY_([A-Z0-9_]+)$/.exec(name);
+    if (m && val) providers[m[1].toLowerCase()] = { key: val };
+  }
+  if (state.providerKeys) Object.assign(providers, state.providerKeys);
+  const endpoints = (state.endpoints || []).filter((e) => e?.url);
+  const execs = await discoverAll({ config: { providers, endpoints } });
+  console.log("HEIMDALL DISCOVERY");
+  console.log("");
+  console.log("1. In-process      (WebGPU / WebLLM / Transformers.js — browser lanes)");
+  console.log("2. localhost probes(:11434 Ollama · :1234 LM Studio · :8080 llama.cpp/LocalAI · :8000 vLLM)");
+  console.log("3. configured LAN / heimdall peers");
+  console.log("4. browser keyless-cloud (Puter.js)");
+  console.log("5. configured credentialed providers (OpenRouter, Groq, …)");
+  console.log("");
+  const lanes = { "in_process": [], "local_open": [], "user_pays": [], "optional_auth": [], "api_key": [], "discovery_only": [] };
+  for (const rec of execs) (lanes[rec.authClass] ||= []).push(rec);
+  const line = (rec) => {
+    const auth = rec.auth?.tested ? (rec.auth.inferenceKeyless ? "no auth (probed)" : "auth required (probed)") : "auth unknown (not probed)";
+    return `  ${String(rec.executor).padEnd(40)} ${rec.location.padEnd(14)} ${auth}`;
+  };
+  console.log("AVAILABLE NOW");
+  console.log("  in-process");
+  for (const r of lanes.in_process) console.log(line(r));
+  console.log("  local / LAN (no auth by default)");
+  for (const r of lanes.local_open) console.log(line(r));
+  console.log("  user-pays (no developer key)");
+  for (const r of lanes.user_pays) console.log(line(r));
+  console.log("  configured / optional auth");
+  for (const r of lanes.optional_auth) console.log(line(r));
+  console.log("  credentialed providers");
+  for (const r of lanes.api_key) console.log(line(r));
+  console.log("  discovery-only (NOT inference)");
+  for (const r of lanes.discovery_only) console.log(line(r));
+  console.log("");
+  console.log(`legit keyless sources: ours · user LAN · heimdall peers · explicitly-public · user-session`);
+  console.log(`(never "port 8080 answered somewhere on the internet")`);
 } else if (cmd === "link") {
   const { probeEndpoint, upsertLink, saveLinks, loadLinks, guessTag, DEFAULT_LINKS_FILE } = await import("../src/links.mjs");
   const url = !args[1] || args[1].startsWith("--") ? flag("--url", "") : args[1];
@@ -118,6 +163,7 @@ if (cmd === "login") {
   console.log("");
   console.log("  heimdall up      run the fleet on this computer: page + Ollama-compatible bridge");
   console.log("                   [--port 8790] [--no-open] [--no-passthrough] [--lend <ollama model>|none]");
+  console.log("  heimdall discover  probe localhost + configured providers, report auth observations");
   console.log("  heimdall invite  [--name \"Your Name\"] [--room !id:hs] [--new] [--hs URL]");
   console.log("                   [--user @me:hs --password …]");
   console.log("  heimdall link    <host:port> [--tag gemma2:2b] [--model ID] [--key TOKEN] [--name phone]");

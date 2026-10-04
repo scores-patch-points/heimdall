@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://scores-patch-points.github.io/heimdall/schemas/heimdall-job@1.json",
+  "title": "HeimdallJob@1",
+  "description": "The universal unit of work (spec §3). Holodeck stops asking for a particular model and submits one of these instead; Heimdall resolves it to an executor. A model field is a pin, and pins exist only when a user explicitly names one.",
+  "type": "object",
+  "required": ["schema", "id", "taskClass", "objective", "privacy", "effects", "requires", "inputs", "output", "protocols"],
+  "properties": {
+    "schema": { "const": "HeimdallJob@1" },
+    "id": { "type": "string", "minLength": 1 },
+    "taskClass": { "type": "string", "pattern": "^[a-z0-9]+(\\.[a-z0-9]+)+$", "description": "Dotted class from src/job.js TASK_CLASSES; routing evidence is keyed on this." },
+    "objective": { "enum": ["interactive", "batch"], "description": "interactive optimizes time-to-acceptable-answer; batch may trade time for money/energy." },
+    "privacy": { "enum": ["local-raw", "sealed-external"], "description": "local-raw = executor inside the trust domain sees raw spans; sealed-external = the provider receives only the external projection (spec §2.I)." },
+    "effects": {
+      "type": "array",
+      "items": { "enum": ["observe", "mutate-local", "mutate-external", "irreversible"] },
+      "description": "Derived mechanically from the required Doors where possible (spec §3)."
+    },
+    "requires": { "type": "array", "items": { "type": "string" }, "description": "Door names the job needs, e.g. door:find, door:read." },
+    "inputs": { "type": "array", "items": { "type": "string" }, "description": "Handles (F12, R18) the job is about." },
+    "output": {
+      "type": "object",
+      "required": ["kind", "maxTokens"],
+      "properties": {
+        "kind": { "enum": ["text", "structured"] },
+        "maxTokens": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "protocols": {
+      "type": "array",
+      "items": { "enum": ["native-tools", "door-grammar", "door-text"] },
+      "description": "Action modes the executor may use; native-tools is an optimization, never a requirement (spec §5)."
+    },
+    "model": { "type": ["string", "null"], "description": "Explicit pin only — set when a user pins a model, never by default." },
+    "deadlineMs": { "type": ["integer", "null"] }
+  },
+  "additionalProperties": false,
+  "falsifyingControl": "a job whose effects do not cover every required Door's effect, or a sealed-external job whose requires contains an operation that cannot be projected, contradicts the contract"
+}

@@ -18,6 +18,101 @@ central server.
 - **WebLLM** — each worker runs a local LLM in its own browser tab via WebGPU.
   Models are cached on-device after the first download.
 
+## Remote inference is another execution lane (2026-10)
+
+Heimdall does not decide "call Anthropic" or "call Groq". It submits a
+**HeimdallJob@1** — a description of the work, not a model name
+(`schemas/heimdall-job@1.json`, `src/job.js`):
+
+```json
+{
+  "schema": "HeimdallJob@1",
+  "taskClass": "formal.counterfactual",
+  "objective": "interactive",
+  "privacy": "sealed-external",
+  "effects": ["observe"],
+  "requires": ["door:structured"],
+  "output": { "kind": "structured", "maxTokens": 500 }
+}
+```
+
+Heimdall resolves it to whichever executor can do the task *right now*. The
+registry (`src/executors.js`) holds remote providers and local horses in ONE
+inventory — `groq:gpt-oss-120b` and `heimdall:phone-7` are the same shape:
+
+```
+executor · endpoint · model · provider · location · authClass · privacyClass
+live:       reachable · inflight · queue · TTFT · tokens/sec
+advertised: tools · structured · context
+observed:   doorbench per taskClass · 429s · 5xx · timeouts
+cost:       provider · user-pays · free/local
+```
+
+**Eligibility first, never scoring.** A `local-raw` job may only go to an
+executor inside the trust domain (local/LAN/private-fleet) willing to see raw
+state. A `sealed-external` job carries nothing raw and may go anywhere. A
+smarter model never overrides the privacy boundary.
+
+**Then time-to-accepted-result.** `E[T_accepted] ≈ (Q + N + S) / P` — wait
+behind existing work, plus network/TTFT, plus expected service time, divided
+by the empirically observed success rate on that task class. A 400ms model
+that succeeds 50% of the time is an 800ms solution. Congestion is learned:
+429s, 5xx, timeouts, and inflight are measured per provider, and the same
+model can be re-routed to a second provider when the first degrades.
+
+**"No developer API key" is a first-class capability.** `src/auth-class.js`
+tells six things apart that are commonly all called "no API key":
+
+| Auth class | Example | Heimdall trust |
+|---|---|---|
+| `in_process` | WebLLM, Transformers.js | local |
+| `local_open` | Ollama, llama.cpp, LM Studio | local/LAN |
+| `user_pays` | Puter.js | external/sealed |
+| `optional_auth` | self-hosted LocalAI | configured |
+| `api_key` | OpenAI, Anthropic, Groq, Together | external/sealed |
+| `discovery_only` | public `/models` endpoints | **not inference** |
+
+The trap is explicit: a keyless **discovery** endpoint does not make
+**inference** keyless. Pollinations' `GET /v1/models` is anonymous; generation
+is not. LocalAI's `/.well-known` is anonymous by design even when its
+inference endpoints are protected. So `src/discovery.js` performs four
+separate assays — DISCOVER, AUTH PROBE, CAPABILITY, DOORBENCH — and Heimdall
+never infers one from another. A `discovery_only` endpoint is never an
+executor.
+
+`heimdall discover` runs the boot sequence and reports every endpoint with its
+auth observation:
+
+```
+HEIMDALL DISCOVERY
+AVAILABLE NOW
+  local / LAN (no auth by default)
+  ollama:qwen2.5-coder:1.5b   local/LAN   no auth (probed)
+  ...
+```
+
+Boot order: in-process (WebGPU/WebLLM/Transformers) → localhost probes
+(`:11434` Ollama · `:1234` LM Studio · `:8080` llama.cpp/LocalAI · `:8000`
+vLLM) → configured LAN/heimdall peers → browser keyless-cloud (Puter.js) →
+configured credentialed providers. Heimdall never crawls the internet for
+stray unauthenticated servers: an open port on someone's IP is not permission
+to use their GPU. Legitimate keyless compute comes only from *ours / the
+user's machine · user-authorized LAN · heimdall peers · explicitly public
+services with keyless terms · user-session services like Puter*.
+
+The provider catalog (`src/providers.js`) is self-healing: free tiers are
+**claims** until a live probe or a response header replaces them with
+observations. `src/dispatch.js` is the ledger — every dispatch records the
+candidates, the reason, the actual ms/tokens/accepted, and the savings meter
+counts lanes with the external-token total exact and the frontier-everything /
+raw-context figures clearly marked as estimates.
+
+`src/remote.js` is the one wire to every executor: OpenAI-compatible
+`/v1/chat/completions` (Groq, OpenRouter, LM Studio, llama.cpp, vLLM,
+LocalAI), Ollama `/api/chat`, and the Puter SDK in a browser (user's session
+pays; no developer key). Every call returns TTFT, tokens/sec, status, and
+timeouts so the registry learns capacity instead of assuming it.
+
 ## Your phone and this computer, one fleet
 
 ```bash
@@ -252,7 +347,7 @@ coordinate as a superorganism, with no leader and no central queue:
   strangers' serves lists only ever attract a forward they must actually
   serve. Credit ledgers stay pairwise (reciprocity needs no center).
 
-Verify it: `node --test src/*.test.mjs` (45 cases: routing, swarm, liveness, revocation, the bridge against a fake Ollama and a fake tab),
+Verify it: `node --test src/*.test.mjs` (45 cases: routing, swarm, liveness, revocation, the bridge against a fake Ollama and a fake tab; plus the remote-inference suites: 64 tests across job/auth-class/executors/dispatch/discovery/remote/providers — including the keyless-discovery falsifier: a keyless `/v1/models` plus a 401 inference call classifies `discovery_only`, never an executor),
 `node scripts/stress-route.mjs` (60 concurrent surfaces × models × two
 heimdalls, migration, per-hop settlement), and
 `node scripts/falsify-route.mjs` (8000 fuzzed picks against the router's
