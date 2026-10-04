@@ -323,6 +323,22 @@ async function up() {
     console.log("  remote lane        discovery failed: " + e.message);
   }
 
+  // The machine door (coding): a running `opencode serve`. Explicit env wins;
+  // otherwise PROBE the usual port so `heimdall up` finds an opencode that is
+  // already running instead of silently serving no code lane (measured: the
+  // bridge reported "no coding machine attached" while opencode listened on
+  // 4099, because `up` never passed the URL the bridge already reads from env).
+  const opencodeUrl = process.env.HEIMDALL_OPENCODE || process.env.OPENCODE_URL || (await (async () => {
+    for (const base of ["http://127.0.0.1:4099", "http://127.0.0.1:4096"]) {
+      // ANY HTTP answer means an opencode server is listening — a 401/400 is a
+      // live door that wants auth or a body, never "not attached". Only a
+      // connection failure (thrown) means absent.
+      try { const r = await fetch(base + "/session", { method: "POST", headers: { "content-type": "application/json" }, body: "{}", signal: AbortSignal.timeout(1500) }); if (r.status > 0) return base; } catch {}
+    }
+    return null;
+  })());
+  if (opencodeUrl) console.log("  code lane          " + opencodeUrl + "  (the machine door)");
+
   const bridge = createBridge({
     port,
     dist,
@@ -332,6 +348,7 @@ async function up() {
     autoOpen: !noOpen,
     site: process.env.HEIMDALL_SITE || SITE,
     frontierExecutors,
+    opencodeUrl,
     log: (line) => console.log(new Date().toISOString().slice(11, 19) + "  " + line),
   });
   try {
