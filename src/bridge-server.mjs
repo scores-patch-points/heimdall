@@ -34,6 +34,7 @@
 
 import http from "node:http";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { exec } from "node:child_process";
@@ -79,6 +80,26 @@ const TYPES = {
   ".map": "application/json",
 };
 
+// A running `opencode serve` may require HTTP basic auth (the desktop app sets
+// OPENCODE_SERVER_USERNAME/PASSWORD). The bridge must present those creds on
+// every call to the machine door — otherwise the door answers 401. When no
+// creds are set, this is a plain fetch.
+function defaultOpencodeFetch(url, init = {}) {
+  const user = process.env.OPENCODE_SERVER_USERNAME;
+  const pass = process.env.OPENCODE_SERVER_PASSWORD;
+  if (!user && !pass) return fetch(url, init);
+  const auth = "Basic " + Buffer.from(`${user ?? ""}:${pass ?? ""}`).toString("base64");
+  return fetch(url, { ...init, headers: { ...(init.headers || {}), authorization: auth } });
+}
+
+// The CLI's state file (`heimdall key` writes providerKeys here). The bridge
+// reads and writes the SAME file so a key entered through the surface lands
+// exactly where the CLI puts it — on this machine, never in a browser.
+const STATE_FILE = path.join(os.homedir(), ".heimdall", "state.json");
+function readState() { try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")) || {}; } catch (e) { return {}; } }
+function writeState(s) { fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true }); fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); }
+const LOOPBACK_ADDR = /^(127\.\d+\.\d+\.\d+|::1|::ffff:127\.\d+\.\d+\.\d+)$/;
+
 export function createBridge({
   port = 8790,
   host = "127.0.0.1",
@@ -90,9 +111,10 @@ export function createBridge({
   autoOpen = true, // try to open a controller tab ourselves when none is connected
   linksFile = DEFAULT_LINKS_FILE,
   frontierExecutors = [], // discovered credentialed providers (discovery.js discoverAll); keys live on this machine
+  allowedOrigins = [], // extra page origins allowed to talk to the bridge (e.g. the fold's GitHub Pages origin); never "*"
   frontierFetch = fetch,
   opencodeUrl = process.env.HEIMDALL_OPENCODE || process.env.OPENCODE_URL || null, // a running `opencode serve` — the machine door for coding
-  opencodeFetch = fetch,
+  opencodeFetch = defaultOpencodeFetch,
   log = () => {},
 } = {}) {
   const tabs = new Set(); // open SSE responses; the newest one is the controller
@@ -110,6 +132,28 @@ export function createBridge({
   for (const ex of frontierExecutors || []) {
     if (!ex?.model || !ex?.endpoint) continue;
     for (const name of [ex.model, `${ex.provider}:${ex.model}`]) frontierMap.set(name, ex);
+  }
+  // Re-run discovery against the CURRENT server-side keys and rebuild the
+  // frontier map, so a key just stored through the surface takes effect without
+  // restarting `heimdall up`. Returns the number of reachable models, or -1 on
+  // a discovery failure (the key is still stored; the map just stays as it was).
+  async function refreshFrontier() {
+    try {
+      const { discoverAll } = await import("./discovery.js");
+      const { loadProviderKeys } = await import("./providers.js");
+      const keys = loadProviderKeys({ state: readState() });
+      const discovered = await discoverAll({ config: { providers: keys } }, { fetchImpl: frontierFetch });
+      const next = new Map();
+      let n = 0;
+      for (const ex of discovered) {
+        if (!(ex?.live?.reachable && ex.location === "external" && ex.model && ex.endpoint)) continue;
+        for (const name of [ex.model, `${ex.provider}:${ex.model}`]) next.set(name, ex);
+        n++;
+      }
+      frontierMap.clear();
+      for (const [k, v] of next) frontierMap.set(k, v);
+      return n;
+    } catch (e) { log("frontier refresh failed: " + e.message); return -1; }
   }
   const isFrontier = (model) => !!model && frontierMap.has(model);
   const frontierGate = (privacy) => privacy === "sealed-external" || privacy === "explicit";
@@ -131,6 +175,16 @@ export function createBridge({
   // drive local inference through the user's browser, so only loopback
   // origins are ever reflected back, never a blanket "*".
   const LOOPBACK_PAGE_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i;
+  // Pages served from an EXPLICIT, named allowlist (e.g. the fold's own GitHub
+  // Pages origin) may also talk to the bridge. This is deliberately a closed
+  // list, never "*": a public page the person named can reach their own bridge,
+  // an arbitrary website still cannot. Env HEIMDALL_ALLOWED_ORIGINS adds more
+  // (comma-separated).
+  const allowedOriginSet = new Set(
+    [...(allowedOrigins || []), ...String(process.env.HEIMDALL_ALLOWED_ORIGINS || "").split(",")]
+      .map((s) => String(s).trim()).filter(Boolean),
+  );
+  const originAllowed = (origin) => selfOrigins.has(origin) || LOOPBACK_PAGE_ORIGIN.test(origin) || allowedOriginSet.has(origin);
 
   // Tab survival: noTabsSince is when the count last dropped to (or started
   // at) zero — null while at least one SSE tab is connected. A boot with no
@@ -721,7 +775,7 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
     // the same loopback-only CORS reflection eoreader7/proxy.mjs uses for
     // its own channel, never a blanket "*".
     const origin = req.headers.origin;
-    const pageOrigin = typeof origin === "string" && (selfOrigins.has(origin) || LOOPBACK_PAGE_ORIGIN.test(origin)) ? origin : null;
+    const pageOrigin = typeof origin === "string" && originAllowed(origin) ? origin : null;
     if (origin && !pageOrigin) return json(res, 403, { error: `origin ${origin} not allowed` });
     if (pageOrigin) {
       res.setHeader("access-control-allow-origin", pageOrigin);
@@ -831,7 +885,35 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
           // they expose — model names and privacy class, never keys.
           const providers = [];
           for (const [name, ex] of frontierMap) providers.push({ model: name, provider: ex.provider, privacy: "sealed-external", reachable: !!ex.live?.reachable, endpoint: ex.endpoint });
-          return json(res, 200, { configured: frontierMap.size > 0, providers, keySource: "server-side (heimdall key / HEIMDALL_KEY_*), never a browser", gate: 'requests must carry heimdall_privacy:"sealed-external" (Fold privacy mode)' });
+          return json(res, 200, { configured: frontierMap.size > 0, providers, keySource: "server-side (heimdall key / HEIMDALL_KEY_* / the surface, never an outside executor)", gate: 'requests must carry heimdall_privacy:"sealed-external" (Fold privacy mode)' });
+        }
+        case "GET /api/providers/keys": {
+          // Which providers have a key set — names only, never the key values.
+          const stored = readState().providerKeys || {};
+          return json(res, 200, { providers: Object.keys(stored).map((p) => ({ provider: p, set: true })), keySource: "server-side (never a browser)" });
+        }
+        case "POST /api/providers/keys": {
+          // Enter an Anthropic/OpenAI (or other catalogued) provider key from a
+          // surface. It is written to the SAME server-side state the CLI uses
+          // (`heimdall key`) and never echoed back. LOOPBACK ONLY: a key can
+          // only be set by a request whose socket is on this machine, so a LAN
+          // client or a proxied request cannot plant one.
+          const addr = req.socket?.remoteAddress || "";
+          if (!LOOPBACK_ADDR.test(addr)) return json(res, 403, { error: "provider keys can only be set from this machine" });
+          let b;
+          try { b = JSON.parse((await readBody(req)).toString() || "{}"); } catch { return json(res, 400, { error: "body must be JSON" }); }
+          const provider = String(b.provider || "").toLowerCase();
+          const { catalogFor } = await import("./providers.js");
+          if (!catalogFor(provider)) return json(res, 400, { error: `unknown provider "${provider}"` });
+          const st = readState();
+          st.providerKeys = st.providerKeys || {};
+          if (b.remove) delete st.providerKeys[provider];
+          else if (typeof b.key === "string" && b.key.trim()) st.providerKeys[provider] = b.key.trim();
+          else return json(res, 400, { error: "body needs { provider, key } or { provider, remove: true }" });
+          writeState(st);
+          const models = await refreshFrontier();
+          log(`provider key ${b.remove ? "removed" : "stored"} for ${provider} (server-side; ${models < 0 ? "discovery failed" : models + " model(s) reachable"})`);
+          return json(res, 200, { ok: true, provider, stored: !b.remove, configured: Object.keys(st.providerKeys), frontierModels: models, keySource: "server-side (never a browser)" });
         }
         case "GET /api/code/status":
           return json(res, 200, { configured: !!opencodeUrl, url: opencodeUrl, note: "the machine door: coding runs on this machine's opencode server, routed through heimdall" });
@@ -847,7 +929,7 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
           if (!b || typeof b.prompt !== "string" || !b.prompt.trim()) return json(res, 400, { error: "body needs { prompt }" });
           const t0 = Date.now();
           try {
-            const out = await opencodeCode(opencodeUrl, { prompt: b.prompt, title: b.title || null, model: b.model || null, agent: b.agent || null, system: b.system || null }, { fetchImpl: opencodeFetch });
+            const out = await opencodeCode(opencodeUrl, { prompt: b.prompt, title: b.title || null, model: b.model || null, agent: b.agent || null, system: b.system || null, sessionId: b.sessionId || null }, { fetchImpl: opencodeFetch });
             stats.code++;
             recordDispatch(
               { id: "code-" + randomUUID(), taskClass: "code.repair", privacy: "local-raw" },
@@ -857,9 +939,33 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
               "deterministic/local",
             );
             log(`code  opencode  ${out.activity.length} tool step(s)  ${out.ms}ms`);
-            return json(res, 200, { sessionId: out.sessionId, text: out.text, activity: out.activity, ms: out.ms, lane: "opencode" });
+            return json(res, 200, { sessionId: out.sessionId, text: out.text, activity: out.activity, ms: out.ms, iterated: !!out.iterated, lane: "opencode" });
           } catch (e) {
             return json(res, 502, { error: "opencode did not answer: " + String(e?.message || e) });
+          }
+        }
+        case "POST /api/read": {
+          // Attachments are READ, never forwarded raw. The bridge hands the
+          // bytes to the khora's model-free constitutional reader (the
+          // perceiver) and returns the reading (EORead@1) — referents,
+          // relations, basis. The surface shows the reading; the model never
+          // receives the raw file. The reader URL is the khora engine proxy.
+          const b = JSON.parse((await readBody(req)).toString() || "{}");
+          const text = String(b.text ?? "");
+          if (!text.trim()) return json(res, 400, { error: "body needs { text }" });
+          const readUrl = process.env.ER7_READ_URL || process.env.KHORA_READ_URL || "http://127.0.0.1:11436/v1/read";
+          try {
+            const r = await fetch(readUrl, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ text, ...(b.source ? { source: b.source } : {}), ...(b.sessionId ? { session: b.sessionId } : {}) }),
+              signal: AbortSignal.timeout(60000),
+            });
+            const j = await r.json().catch(() => ({ error: "khora read returned no json" }));
+            log(`read  khora  ${(j.referents ?? []).length} referent(s)  ${j.ms ?? "?"}ms`);
+            return json(res, r.ok ? 200 : 502, j);
+          } catch (e) {
+            return json(res, 502, { error: "khora read did not answer: " + String(e?.message || e) });
           }
         }
         default:

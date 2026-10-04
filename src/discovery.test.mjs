@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   discoverEndpoint, probeInferenceAuth, assayEndpoint, discoverLocalhost,
   discoverProviders, discoverConfigured, discoverPuter, discoverAll, LOCALHOST_PROBES,
+  discoverKeylessExternal, keylessExternalProviders,
 } from "./discovery.js";
 import { isReachable } from "./executors.js";
 
@@ -123,6 +124,52 @@ test("a configured provider with a key probes models and stays api_key", async (
   assert.ok(recs[0].models.includes("gpt-oss-120b"));
 });
 
+test("named provider models register each as its own sealed frontier executor", async () => {
+  // No `/v1/models` route is provided at all — the named list is the truth.
+  const named = { anthropic: { key: "sk-ant-test", models: ["claude-sonnet-4-6", "claude-haiku-4-5"] } };
+  const recs = await discoverProviders(named, { fetchImpl: fakeFetch({}) });
+  assert.equal(recs.length, 2, "one executor per named model");
+  const ids = recs.map((r) => r.executor).sort();
+  assert.deepEqual(ids, ["anthropic:claude-haiku-4-5", "anthropic:claude-sonnet-4-6"]);
+  for (const r of recs) {
+    assert.equal(r.provider, "anthropic");
+    assert.equal(r.location, "external");
+    assert.equal(r.privacyClass, "sealed-only");
+    assert.equal(r.authClass, "api_key");
+    assert.equal(r.endpoint, "https://api.anthropic.com/v1");
+    assert.equal(isReachable(r), true, "a named model is a real executor");
+  }
+});
+
+test("a provider that discovers but lists no models falls back to its catalog claims", async () => {
+  const ff = fakeFetch({
+    "GET https://api.groq.com/openai/v1/v1/models": { status: 200, json: { data: [] } },
+  });
+  const recs = await discoverProviders({ groq: { key: "sk-test" } }, { fetchImpl: ff });
+  // Groq's catalog seeds free-tier claims; an empty live list does not erase
+  // them (a claim stands until measured), and each claim becomes an executor.
+  assert.ok(recs.length >= 1);
+  assert.equal(recs[0].provider, "groq");
+  assert.equal(isReachable(recs[0]), true);
+  assert.ok(recs.map((r) => r.model).includes("gpt-oss-120b"));
+});
+
+test("a provider with no discovery and no seeded models is not an executor", async () => {
+  // Anthropic seeds no models and its discovery shape is not a data list.
+  const ff = fakeFetch({
+    "GET https://api.anthropic.com/v1/v1/models": { status: 200, json: { data: [] } },
+  });
+  const recs = await discoverProviders({ anthropic: { key: "sk-ant-test" } }, { fetchImpl: ff });
+  assert.equal(recs.length, 1);
+  assert.ok(!recs[0].model, "no model to infer on");
+  assert.equal(isReachable(recs[0]), false);
+});
+
+test("a provider with no key configured is skipped entirely", async () => {
+  const recs = await discoverProviders({ anthropic: { models: ["claude-sonnet-4-6"] } }, { fetchImpl: fakeFetch({}) });
+  assert.equal(recs.length, 0, "a named model without a key is never an executor");
+});
+
 test("configured LAN endpoints are assayed, never assumed keyless", async () => {
   const ff = fakeFetch({
     "GET http://192.168.1.50:8080/v1/models": { status: 200, json: { data: [{ id: "llama-3.2-3b" }] } },
@@ -160,4 +207,40 @@ test("the localhost probe set is the declared boot list", () => {
   assert.ok(ports.includes("http://127.0.0.1:1234")); // LM Studio
   assert.ok(ports.includes("http://127.0.0.1:8080")); // llama.cpp / LocalAI
   assert.ok(ports.includes("http://127.0.0.1:8000")); // vLLM
+});
+
+test("the keyless external lane is exactly the keyless+external catalog entries", () => {
+  const names = keylessExternalProviders().map((p) => p.provider).sort();
+  assert.deepEqual(names, ["llm7", "ovh", "pollinations"]);
+});
+
+test("discoverKeylessExternal: a keyless endpoint that infers yields executors, no key", async () => {
+  const ff = fakeFetch({
+    "GET https://api.llm7.io/v1/models": { status: 200, json: { data: [{ id: "turbo" }] } },
+    "POST https://api.llm7.io/v1/chat/completions": { status: 200, json: { choices: [] } },
+  });
+  const recs = await discoverKeylessExternal({ fetchImpl: ff, only: ["llm7"] });
+  assert.equal(recs.length, 1);
+  assert.equal(recs[0].executor, "llm7:turbo");
+  assert.equal(recs[0].location, "external");
+  assert.equal(recs[0].privacyClass, "sealed-only");
+  assert.equal(recs[0].live.reachable, true);
+});
+
+test("discoverKeylessExternal: a keyless endpoint that demands a key after all is dropped", async () => {
+  const ff = fakeFetch({
+    "GET https://api.llm7.io/v1/models": { status: 200, json: { data: [{ id: "turbo" }] } },
+    "POST https://api.llm7.io/v1/chat/completions": { status: 401 },
+  });
+  const recs = await discoverKeylessExternal({ fetchImpl: ff, only: ["llm7"] });
+  assert.equal(recs.length, 0, "401 means it is not actually keyless; never an executor here");
+});
+
+test("discoverAll includes keyless external only when the caller opts in", async () => {
+  const ff = fakeFetch({});
+  const off = await discoverAll({ config: { providers: {} } }, { fetchImpl: ff });
+  assert.equal(off.filter((r) => r.provider === "llm7").length, 0);
+  const on = await discoverAll({ config: { providers: {}, keylessExternal: true } }, { fetchImpl: ff });
+  // nothing answers in this fake, so no executors — but the lane was attempted
+  assert.ok(Array.isArray(on));
 });

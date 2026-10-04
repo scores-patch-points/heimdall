@@ -97,14 +97,15 @@ if (cmd === "login") {
   const state = load();
   const providers = loadProviderKeys({ state });
   const endpoints = (state.endpoints || []).filter((e) => e?.url);
-  const execs = await discoverAll({ config: { providers, endpoints } });
+  const execs = await discoverAll({ config: { providers, endpoints, keylessExternal: true } });
   console.log("HEIMDALL DISCOVERY");
   console.log("");
   console.log("1. In-process      (WebGPU / WebLLM / Transformers.js — browser lanes)");
   console.log("2. localhost probes(:11434 Ollama · :1234 LM Studio · :8080 llama.cpp/LocalAI · :8000 vLLM)");
   console.log("3. configured LAN / heimdall peers");
-  console.log("4. browser keyless-cloud (Puter.js)");
-  console.log("5. configured credentialed providers (OpenRouter, Groq, …)");
+  console.log("4. keyless external (Pollinations · LLM7 · OVHcloud — no key)");
+  console.log("5. browser keyless-cloud (Puter.js)");
+  console.log("6. configured credentialed providers (OpenRouter, Groq, …)");
   console.log("");
   const lanes = { "in_process": [], "local_open": [], "user_pays": [], "optional_auth": [], "api_key": [], "discovery_only": [] };
   for (const rec of execs) (lanes[rec.authClass] ||= []).push(rec);
@@ -154,18 +155,28 @@ if (cmd === "login") {
   // browser page. `heimdall key anthropic sk-…` writes state.providerKeys; the
   // discovery boot (heimdall discover / the bridge) merges these with the
   // HEIMDALL_KEY_<PROVIDER> env vars. Keys are never echoed back.
-  const { catalogFor } = await import("../src/providers.js");
+  //
+  // `--model <id>` (repeatable) names the models a provider serves, stored in
+  // state.providerModels. A provider whose `/v1/models` is not a list
+  // (Anthropic) or that carries many models the caller wants picks them here,
+  // and discovery registers each as a frontier executor.
+  const { catalogFor, loadProviderKeys } = await import("../src/providers.js");
   const state = load();
   const providers = state.providerKeys || (state.providerKeys = {});
+  const modelsOf = state.providerModels || (state.providerModels = {});
+  const named = args.reduce((acc, a, i) => (a === "--model" && args[i + 1] ? [...acc, args[i + 1]] : acc), []);
   const rm = args.includes("--rm");
   const provider = args[1] === "--rm" ? args[2] : args[1];
   const keyArg = args[1] === "--rm" ? args[3] : args[2];
   if (!provider) {
-    const rows = Object.entries(providers);
+    const rows = Object.entries(loadProviderKeys({ state }));
     console.log(rows.length ? "CONFIGURED PROVIDER KEYS (stored in " + STATE + ")" : "NO PROVIDER KEYS STORED");
-    for (const [p, k] of rows) console.log("  " + p + "  " + (k ? "set (" + k.length + " chars)" : "set"));
+    for (const [p, v] of rows) {
+      const n = modelsOf[p]?.length ? `  · models: ${modelsOf[p].join(", ")}` : "";
+      console.log("  " + p + "  set (" + String(v.key || "").length + " chars)" + n);
+    }
     console.log("");
-    console.log("set:   heimdall key <provider> <key>     (e.g. heimdall key anthropic sk-ant-…)");
+    console.log("set:   heimdall key <provider> <key> [--model <id> …]   (e.g. heimdall key anthropic sk-ant-…)");
     console.log("remove: heimdall key --rm <provider>");
     console.log("env:   HEIMDALL_KEY_<PROVIDER> also counts (no storage needed).");
     process.exit(0);
@@ -177,19 +188,25 @@ if (cmd === "login") {
   }
   if (rm) {
     delete providers[provider];
+    delete modelsOf[provider];
     save(state);
     console.log(`removed provider key for ${provider}`);
     process.exit(0);
   }
   if (keyArg) {
     providers[provider] = keyArg;
+    if (named.length) modelsOf[provider] = [...new Set(named)];
     save(state);
     console.log(`stored provider key for ${provider} (${keyArg.length} chars) in ${STATE}`);
+    if (named.length) console.log(`named models for ${provider}: ${modelsOf[provider].join(", ")}`);
     console.log("the bridge and discovery read it from here; nothing about it reaches a browser.");
     process.exit(0);
   }
-  if (providers[provider]) console.log(`${provider}: set (${providers[provider].length} chars) — ${known.base || "custom base"} — ${known.trust}`);
-  else console.log(`${provider}: not set`);
+  const set = loadProviderKeys({ state })[provider];
+  if (set) {
+    const n = modelsOf[provider]?.length ? `  · models: ${modelsOf[provider].join(", ")}` : "";
+    console.log(`${provider}: set (${String(set.key).length} chars) — ${known.base || "custom base"} — ${known.trust}${n}`);
+  } else console.log(`${provider}: not set`);
 } else if (cmd === "reset") {
   save({});
   console.log("stored session cleared");
@@ -199,10 +216,13 @@ if (cmd === "login") {
   console.log("heimdall — distributed inference invites");
   console.log("");
   console.log("  heimdall up      run the fleet on this computer: page + Ollama-compatible bridge");
-  console.log("                   [--port 8790] [--no-open] [--no-passthrough] [--lend <ollama model>|none]");
+  console.log("                   [--port 8790] [--no-open] [--no-passthrough] [--no-keyless] [--lend <ollama model>|none]");
+  console.log("                   --no-keyless skips probing the keyless external providers at boot");
   console.log("  heimdall discover  probe localhost + configured providers, report auth observations");
   console.log("  heimdall key       store/remove frontier provider API keys for THIS machine (server-side, never in a browser)");
-  console.log("                     heimdall key <provider> <key>  ·  heimdall key --rm <provider>  ·  heimdall key (list)");
+  console.log("                     heimdall key <provider> <key> [--model <id> …]  ·  heimdall key --rm <provider>  ·  heimdall key (list)");
+  console.log("                     --model names the models a provider serves (repeatable); required for providers");
+  console.log("                     whose /v1/models is not a list (anthropic), and how to register several models at once");
   console.log("  heimdall invite  [--name \"Your Name\"] [--room !id:hs] [--new] [--hs URL]");
   console.log("                   [--user @me:hs --password …]");
   console.log("  heimdall link    <host:port> [--tag gemma2:2b] [--model ID] [--key TOKEN] [--name phone]");
@@ -287,14 +307,16 @@ async function up() {
 
   // Frontier providers configured on THIS machine (`heimdall key` + the
   // HEIMDALL_KEY_* env) — discovered once at boot and lent to the bridge as
-  // sealed-only executors. The keys never reach a browser. A provider whose
-  // probe failed is not offered: reachable is measured, never assumed.
+  // sealed-only executors. The keys never reach a browser. Alongside them, the
+  // keyless external endpoints (Pollinations, LLM7, OVHcloud) are probed
+  // with no credential. A provider whose probe failed is not offered:
+  // reachable is measured, never assumed.
   let frontierExecutors = [];
   try {
     const { discoverAll } = await import("../src/discovery.js");
     const { loadProviderKeys } = await import("../src/providers.js");
     const keyState = load();
-    const discovered = await discoverAll({ config: { providers: loadProviderKeys({ state: keyState }) } });
+    const discovered = await discoverAll({ config: { providers: loadProviderKeys({ state: keyState }), keylessExternal: has("--keyless") || !has("--no-keyless") } });
     frontierExecutors = discovered.filter((r) => r.live?.reachable && r.location === "external" && r.model && r.endpoint);
     if (frontierExecutors.length) console.log("  remote lane        " + frontierExecutors.map((r) => `${r.provider}:${r.model}`).join(", ") + "  (sealed-external only)");
   } catch (e) {

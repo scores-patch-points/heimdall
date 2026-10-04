@@ -40,6 +40,20 @@ const PROVIDER_ENDPOINTS = Object.freeze({
   anthropic: { kind: "anthropic", base: "https://api.anthropic.com/v1" },
   together: { kind: "openai", base: "https://api.together.xyz/v1" },
   cerebras: { kind: "openai", base: "https://api.cerebras.ai/v1" },
+  // ---- free-tier, no-card providers (2026): OpenAI-compatible unless noted
+  sambanova: { kind: "openai", base: "https://api.sambanova.ai/v1" },
+  github: { kind: "openai", base: "https://models.github.ai/inference" },
+  nvidia: { kind: "openai", base: "https://integrate.api.nvidia.com/v1" },
+  ollamacloud: { kind: "openai", base: "https://ollama.com/v1" },
+  zai: { kind: "openai", base: "https://api.z.ai/api/paas/v4" },
+  modelscope: { kind: "openai", base: "https://api-inference.modelscope.cn/v1" },
+  // ---- genuinely keyless inference (no developer key, no user session)
+  // Bases are ORIGINS (discovery appends /v1/models, chat /v1/chat/completions).
+  // Pollinations' OpenAI surface is /openai and its model list is /openai/models
+  // (not /openai/v1/models), so its discovery path is overridden via path.
+  pollinations: { kind: "openai", base: "https://text.pollinations.ai/openai", path: "/models" },
+  llm7: { kind: "openai", base: "https://api.llm7.io" },
+  ovh: { kind: "openai", base: "https://oai.endpoints.kepler.ai.cloud.ovh.net" },
 });
 
 /** Known free / keyless lanes, seeded so discovery has somewhere to start.
@@ -58,6 +72,14 @@ export const PROVIDER_CATALOG = Object.freeze([
   { provider: "heimdall-peer", authClass: "local_open", location: "private-fleet", cardRequired: false, trust: "local-raw", browser: true, models: [] },
   // ---- keyless-cloud: the user's session pays, the developer holds no key
   { provider: "puter", authClass: "user_pays", location: "external", cardRequired: false, trust: "sealed-only", browser: true, endpointKind: "puter", models: [] },
+  // ---- genuinely keyless inference (no developer key AND no user session).
+  // These are public/anonymous OpenAI-compatible endpoints (some take an
+  // optional key for higher limits). They are external and sealed-only; a
+  // discovery probe measures reachability, and classifies them local_open
+  // because inference is keyless.
+  { provider: "pollinations", authClass: "local_open", location: "external", cardRequired: false, trust: "sealed-only", keyless: true, freeQuota: "anonymous tier, rate-limited (openai-fast)", models: ["openai-fast"] },
+  { provider: "llm7", authClass: "local_open", location: "external", cardRequired: false, trust: "sealed-only", keyless: true, freeQuota: "anonymous 'turbo' models; a free token raises limits", models: [] },
+  { provider: "ovh", authClass: "local_open", location: "external", cardRequired: false, trust: "sealed-only", keyless: true, freeQuota: "anonymous, 2 req/min/IP/model, 20+ open models", models: [] },
   // ---- credentialed providers with free tiers (claims; live discovery wins)
   { provider: "openrouter", authClass: "api_key", location: "external", cardRequired: false, trust: "sealed-only", freeQuota: "50 req/day (free models)", models: ["openrouter/free", "openrouter/auto"] },
   { provider: "groq", authClass: "api_key", location: "external", cardRequired: false, trust: "sealed-only", freeQuota: "30 RPM / 1k req/day / 200k tok/day (gpt-oss-120b)", models: ["gpt-oss-120b", "gpt-oss-20b", "qwen/qwen3-27b"] },
@@ -66,6 +88,12 @@ export const PROVIDER_CATALOG = Object.freeze([
   { provider: "google", authClass: "api_key", location: "external", cardRequired: false, trust: "sealed-only", freeQuota: "model-specific free tier (data may train Google)", models: [] },
   { provider: "cloudflare", authClass: "api_key", location: "external", cardRequired: false, trust: "sealed-only", freeQuota: "10k neurons/day", models: [] },
   { provider: "huggingface", authClass: "api_key", location: "external", cardRequired: false, trust: "sealed-only", freeQuota: "$0.10/mo credit", models: [] },
+  { provider: "sambanova", authClass: "api_key", location: "external", cardRequired: false, trust: "sealed-only", freeQuota: "rate-limited free tier (no card); commercial license", models: [] },
+  { provider: "github", authClass: "api_key", location: "external", cardRequired: false, trust: "sealed-only", freeQuota: "GitHub account; Copilot-tier limits (15 RPM/150 RPD)", models: [] },
+  { provider: "nvidia", authClass: "api_key", location: "external", cardRequired: false, trust: "sealed-only", freeQuota: "40 RPM recurring rate limit", models: [], note: "NVIDIA NIM trial ToS: evaluation-only, not production" },
+  { provider: "ollamacloud", authClass: "api_key", location: "external", cardRequired: false, trust: "sealed-only", freeQuota: "$0 Free plan: cloud-hosted open models, 1 concurrent / 5h session", models: [] },
+  { provider: "zai", authClass: "api_key", location: "external", cardRequired: false, trust: "sealed-only", freeQuota: "permanent free models (GLM flash tier)", models: [] },
+  { provider: "modelscope", authClass: "api_key", location: "external", cardRequired: false, trust: "sealed-only", freeQuota: "free API-Inference; Alibaba Cloud + real-name verification required", models: [] },
   // ---- credentialed, paid
   { provider: "openai", authClass: "api_key", location: "external", cardRequired: true, trust: "sealed-only", models: [] },
   { provider: "anthropic", authClass: "api_key", location: "external", cardRequired: true, trust: "sealed-only", models: [] },
@@ -89,7 +117,11 @@ export function catalogFor(providerName) {
 
 /** The configured provider keys, merged from env (`HEIMDALL_KEY_<PROVIDER>`)
  *  and the CLI's stored `state.providerKeys` (keys are entered on this
- *  machine and never reach a browser). Pure; returns { provider: { key } }. */
+ *  machine and never reach a browser). Pure; returns { provider: { key } }.
+ *
+ *  `state.providerModels` (set by `heimdall key <provider> <key> --model …`)
+ *  rides along as `{ provider: { key, models } }` so discovery can register a
+ *  provider whose `/v1/models` cannot answer (Anthropic) as real executors. */
 export function loadProviderKeys({ env = process.env, state = {} } = {}) {
   const providers = {};
   for (const [name, val] of Object.entries(env)) {
@@ -102,6 +134,9 @@ export function loadProviderKeys({ env = process.env, state = {} } = {}) {
   for (const [name, val] of Object.entries(state.providerKeys || {})) {
     if (typeof val === "string" && val) providers[name] = { key: val };
     else if (val && typeof val === "object" && val.key) providers[name] = { key: val.key };
+  }
+  for (const [name, models] of Object.entries(state.providerModels || {})) {
+    if (providers[name] && Array.isArray(models) && models.length) providers[name].models = models.filter(Boolean);
   }
   return providers;
 }

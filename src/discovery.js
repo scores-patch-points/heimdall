@@ -25,7 +25,7 @@
 
 import { authObservation, classifyAuth } from "./auth-class.js";
 import { emptyExecutor } from "./executors.js";
-import { makeProviderRecord } from "./providers.js";
+import { makeProviderRecord, PROVIDER_CATALOG, endpointFor } from "./providers.js";
 
 export const LOCALHOST_PROBES = Object.freeze([
   { provider: "ollama", kind: "ollama", base: "http://127.0.0.1:11434", discovery: "/api/tags" },
@@ -150,33 +150,88 @@ export async function discoverLocalhost({ fetchImpl = fetch } = {}) {
 
 /** Step 2: configured credentialed providers (free tiers and paid alike).
  *  `config` is { provider: { key, base?, models? } }. A configured provider
- *  with a key gets its model list refreshed by live discovery. */
+ *  with a key gets its model list refreshed by live discovery.
+ *
+ *  When the configured models are NAMED (`cfg.models` non-empty), they are
+ *  the models: each becomes its own executor, and the `/v1/models` assay is
+ *  skipped. This is what makes a provider whose discovery endpoint is not an
+ *  OpenAI `{data:[…]}` list — Anthropic's `/v1/models` — an actual frontier
+ *  executor instead of a doctor that finds nothing. Discovery is a courtesy,
+ *  not a gate: it can only REMOVE a lane it saw is dead (a successful probe
+ *  that listed nothing), never a lane the person named. A provider with no
+ *  named models keeps the old behavior — one executor from the discovered
+ *  list, or the claims the catalog seeded. Pinned models only override by
+ *  intent; when discovery also lists models they are merged in. */
 export async function discoverProviders(config = {}, { fetchImpl = fetch } = {}) {
   const out = [];
   for (const [provider, cfg] of Object.entries(config || {})) {
     if (!cfg?.key) continue;
     const rec = makeProviderRecord(provider, { base: cfg.base, reachable: false });
     if (!rec) continue;
+    const named = Array.isArray(cfg.models) ? cfg.models.filter(Boolean) : [];
+    // A named model list is a declaration, not a discovery result: it always
+    // yields executors, so no `/v1/models` assay is needed (and Anthropic's
+    // non-list shape can never blank the lane). Reachability is still measured:
+    // each named model is inference-probed, and only a probe that did not
+    // observe an auth failure is offered (a 200/404/keyless is reachable; a
+    // 401/403 marks the executor unreachable with the reason, never silent).
+    if (named.length) {
+      for (const model of named) {
+        const exec = executorFor(rec, cfg, model);
+        const a = await probeInferenceAuth({ url: rec.base, kind: rec.endpointKind, key: cfg.key, model, fetchImpl });
+        exec.live.reachable = a.keyless !== false;
+        exec.live.lastVerified = a.keyless !== false ? Date.now() : null;
+        exec.live.lastError = a.keyless === false ? "inference probe refused the key (" + (a.status ?? "?") + ")" : null;
+        exec.auth.inferenceKeyless = a.keyless;
+        exec.auth.tested = a.tested;
+        out.push(exec);
+      }
+      continue;
+    }
     const d = await discoverEndpoint({ base: cfg.base || rec.base, kind: rec.endpointKind, fetchImpl }).catch(() => ({ ok: false }));
     if (!d.ok) {
       rec.live.lastError = "discovery failed";
+      rec.executor = `${rec.provider}:?`; // still a named record for the UI, never `undefined`
       out.push(rec);
       continue;
     }
-    const a = await probeInferenceAuth({ url: d.url, kind: d.kind, key: cfg.key, model: d.models[0] ?? "t", fetchImpl });
-    rec.auth = authObservation({
-      kind: rec.authClass,
-      developerKey: true,
-      inferenceKeyless: a.keyless,
-      tested: a.tested,
-    });
-    rec.models = d.models.length ? d.models : rec.models;
-    rec.live.reachable = true;
-    rec.live.lastVerified = Date.now();
-    rec.rateLimits.observed429 = 0;
-    out.push(rec);
+    const models = d.models.length ? d.models : rec.models;
+    if (!models.length) {
+      // The probe answered but listed nothing to infer on: not an executor.
+      rec.live.lastError = "discovery listed no models";
+      rec.executor = `${rec.provider}:?`;
+      out.push(rec);
+      continue;
+    }
+    for (const model of models) out.push(executorFor(rec, cfg, model, d.kind, true));
   }
   return out;
+}
+
+/** One frontier executor for one configured model: the provider record's
+ *  claims, plus the auth verdict the inference probe gives (a configured key
+ *  implies inference auth unless the probe explicitly observed otherwise).
+ *  `reachable` is MEASURED by the caller's assay — true only where a probe
+ *  answered; the named-model path sets it from its own inference probe. */
+function executorFor(rec, cfg, model, kind = rec.endpointKind, reachable = false) {
+  const exec = emptyExecutor({
+    executor: `${rec.provider}:${model}`,
+    endpoint: rec.base,
+    model,
+    provider: rec.provider,
+    location: "external",
+    authClass: rec.authClass,
+    privacyClass: "sealed-only",
+  });
+  exec.live.reachable = reachable;
+  exec.live.lastVerified = reachable ? Date.now() : null;
+  exec.live.lastError = rec.live.lastError ?? null;
+  exec.auth = authObservation({ kind: rec.authClass, developerKey: true, tested: true, inferenceKeyless: false, note: null });
+  exec.models = [model];
+  exec.advertised.structured = false;
+  exec.advertised.tools = false;
+  exec.cost = { kind: "provider", freeLocal: false };
+  return exec;
 }
 
 /** Step 3: configured LAN / heimdall peers — a user-authorized endpoint list.
@@ -219,8 +274,58 @@ export async function discoverPuter({ puter = null } = {}) {
   }
 }
 
+/** The keyless EXTERNAL providers from the catalog: public endpoints that
+ *  infer with no developer key (some take an optional key for higher limits).
+ *  Pollinations, LLM7, OVHcloud. They are `local_open` by auth
+ *  (inference is keyless) but `external` and sealed-only by location, so a
+ *  `local-raw` job never reaches them. */
+export function keylessExternalProviders() {
+  return PROVIDER_CATALOG.filter((p) => p.keyless && p.location === "external");
+}
+
+/** Step 3b: probe the keyless external providers. No key is configured, so
+ *  each is discovered and inference-probed with no credential; only a probe
+ *  that did not observe an auth failure yields executors, and one executor is
+ *  made per model the endpoint lists (or the catalog's claim when it lists
+ *  none). A provider with no usable model is dropped, never guessed. */
+export async function discoverKeylessExternal({ fetchImpl = fetch, only = null } = {}) {
+  const out = [];
+  for (const claim of keylessExternalProviders()) {
+    if (only && !only.includes(claim.provider)) continue;
+    const ep = endpointFor(claim.provider);
+    const base = claim.base ?? ep?.base ?? null;
+    if (!base) continue;
+    const kind = claim.endpointKind ?? ep?.kind ?? "openai";
+    const path = claim.path ?? ep?.path ?? null; // e.g. Pollinations' /models
+    const d = await discoverEndpoint({ base, kind, path, fetchImpl }).catch(() => ({ ok: false }));
+    if (!d.ok) continue;
+    const a = await probeInferenceAuth({ url: d.url, kind: d.kind, model: d.models[0] ?? "t", fetchImpl });
+    if (a.keyless === false) continue; // asked for a credential after all: not keyless
+    const models = d.models.length ? d.models : (claim.models || []);
+    for (const model of models) {
+      const rec = emptyExecutor({
+        executor: `${claim.provider}:${model}`,
+        endpoint: base,
+        model,
+        provider: claim.provider,
+        location: "external",
+        authClass: "local_open",
+        privacyClass: "sealed-only",
+      });
+      rec.live.reachable = true;
+      rec.live.lastVerified = Date.now();
+      rec.models = [model];
+      rec.auth = authObservation({ kind: "local_open", discoveryKeyless: d.discoveryKeyless, inferenceKeyless: a.keyless, tested: a.tested, note: "keyless external inference; no developer key" });
+      rec.cost = { kind: "free/local", freeLocal: false };
+      out.push(rec);
+    }
+  }
+  return out;
+}
+
 /** The full boot: in-process (browser only) + localhost probes + configured
- *  LAN/peers + Puter + credentialed providers. Returns executor records. */
+ *  LAN/peers + keyless external + Puter + credentialed providers. Returns
+ *  executor records. */
 export async function discoverAll({ config = null, browser = typeof window !== "undefined" } = {}, { fetchImpl = fetch } = {}) {
   const out = [];
   const cfg = config || {};
@@ -241,6 +346,12 @@ export async function discoverAll({ config = null, browser = typeof window !== "
   out.push(...local);
   const configured = await discoverConfigured(cfg.endpoints || [], { fetchImpl });
   out.push(...configured);
+  // Keyless external providers only when the caller opted in (the bridge's
+  // boot asks for them; a bare probe sweep stays local by default).
+  if (cfg.keylessExternal) {
+    const keyless = await discoverKeylessExternal({ fetchImpl }).catch(() => []);
+    out.push(...keyless);
+  }
   const providers = await discoverProviders(cfg.providers || {}, { fetchImpl });
   out.push(...providers);
   return out;

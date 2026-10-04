@@ -89,13 +89,17 @@ export async function messages(base, sessionID, { fetchImpl = fetch, limit = 50,
   return arr.map(partsOf);
 }
 
-/** One coding job, end to end: create a session, prompt it, return what it
- *  did. This is the heimdall executor's call — the bridge decides when a job
- *  is a coding job and routes it here. `onActivity` may stream tool rows as
- *  they are parsed from the final message (the SSE stream is a later seam). */
-export async function code(base, { prompt: text, title = null, model = null, agent = null, system = null } = {}, { fetchImpl = fetch, timeoutMs = 300000 } = {}) {
+/** One coding job, end to end: create a session (or CONTINUE one, so the loop
+ *  iterates via the record — the opencode session is the EOT ledger for code),
+ *  prompt it, return what it did. `sessionId` continues an existing session:
+ *  the same session id means the next turn builds on the retained record. */
+export async function code(base, { prompt: text, title = null, model = null, agent = null, system = null, sessionId = null } = {}, { fetchImpl = fetch, timeoutMs = 300000 } = {}) {
   const t0 = Date.now();
-  const { id } = await createSession(base, { title: title || "fold code", model }, { fetchImpl });
+  // Create the session WITHOUT a model (CreateInput.model is a different
+  // shape and rejects a ModelRef); the model rides the prompt, where
+  // PromptInput.model is the ModelRef the server expects. When a sessionId is
+  // given, continue that session — iteration via the EOT ledger.
+  const id = sessionId || (await createSession(base, { title: title || "fold code" }, { fetchImpl })).id;
   const out = await prompt(base, id, text, { model, agent, system }, { fetchImpl, timeoutMs });
-  return { sessionId: id, text: out.text, activity: out.activity, ms: Date.now() - t0 };
+  return { sessionId: id, text: out.text, activity: out.activity, ms: Date.now() - t0, iterated: !!sessionId };
 }

@@ -10,6 +10,27 @@ test("the catalog seeds the keyless lanes explicitly", () => {
   }
 });
 
+test("the catalog seeds the keyless external providers (no developer key)", () => {
+  const keyless = PROVIDER_CATALOG.filter((p) => p.keyless);
+  const names = keyless.map((p) => p.provider).sort();
+  assert.deepEqual(names, ["llm7", "ovh", "pollinations"]);
+  for (const p of keyless) {
+    assert.equal(p.location, "external", p.provider);
+    assert.equal(p.trust, "sealed-only", p.provider);
+    assert.equal(p.cardRequired, false, p.provider);
+  }
+});
+
+test("the catalog seeds the no-card free-tier providers as api_key", () => {
+  const byName = Object.fromEntries(PROVIDER_CATALOG.map((p) => [p.provider, p]));
+  for (const p of ["sambanova", "github", "nvidia", "ollamacloud", "zai", "modelscope"]) {
+    assert.ok(byName[p], p);
+    assert.equal(byName[p].authClass, "api_key", p);
+    assert.equal(byName[p].cardRequired, false, p);
+    assert.equal(byName[p].location, "external", p);
+  }
+});
+
 test("Puter is user_pays with no developer key", () => {
   const rec = makeProviderRecord("puter");
   assert.equal(rec.authClass, "user_pays");
