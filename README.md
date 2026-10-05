@@ -5,6 +5,11 @@ Distributed local inference. You get a link. Anyone who opens it and presses
 collectively. Their device downloads a small model, runs it locally in the
 browser, and streams answers back to you.
 
+> **The whole map:** [ACTIVITIES.md](ACTIVITIES.md) documents every layer of
+> heimdall's work — the doors, the gate, the degradation ladder (a higher
+> rung that breaks steps down to the next and the record shows the drop), the
+> executors, and the honest test/security truth.
+
 No accounts to create for workers, no server to rent, no data ever stored on a
 central server.
 
@@ -347,12 +352,15 @@ coordinate as a superorganism, with no leader and no central queue:
   strangers' serves lists only ever attract a forward they must actually
   serve. Credit ledgers stay pairwise (reciprocity needs no center).
 
-Verify it: `node --test src/*.test.mjs` (45 cases: routing, swarm, liveness, revocation, the bridge against a fake Ollama and a fake tab; plus the remote-inference suites: 64 tests across job/auth-class/executors/dispatch/discovery/remote/providers — including the keyless-discovery falsifier: a keyless `/v1/models` plus a 401 inference call classifies `discovery_only`, never an executor),
-`node scripts/stress-route.mjs` (60 concurrent surfaces × models × two
-heimdalls, migration, per-hop settlement), and
-`node scripts/falsify-route.mjs` (8000 fuzzed picks against the router's
-invariants plus adversarial envelopes, replays, and garbage input —
-controls built to fail, per the project's own II.23), and
+Verify it: `node --test src/*.test.mjs` (114 cases: the sealed frontier
+gate, the degradation ladder — a broken higher rung steps down to the next
+and the ledger records the drop — the remote-inference suites across
+job/auth-class/executors/dispatch/discovery/remote/providers, the key store,
+and origin reflection; the keyless-discovery falsifier is there: a keyless
+`/v1/models` plus a 401 inference call classifies `discovery_only`, never an
+executor). The fleet path itself (Matrix, WebRTC, the router, liveness) has
+no automated test yet — see [ACTIVITIES.md](ACTIVITIES.md) for what is
+actually covered, and
 `node scripts/measure-routing.mjs` (the A/B that prices the work:
 model-blind round-robin vs the new router on the same seeded bursts —
 wrong-model 12–15 → 0 with all 30 served, free-job avg 8840 → 3667ms

@@ -329,13 +329,49 @@ export function createBridge({
     });
   }
 
-  /** One chat on whichever giver is best: a linked native app first (real
-   *  GPU, survives without a controller tab), else the browser fleet. */
-  function runOnGiver(model, opts, onToken) {
-    if (frontierMap.has(model)) return runOnFrontier(model, opts, onToken);
+  /** One chat on the best alive rung of the DEGRADATION LADDER. The rungs, in
+   *  order of power: a configured frontier executor (sealed) → a linked native
+   *  app (real GPU, survives without a controller tab) → the browser fleet →
+   *  upstream Ollama (the caller's own fall-through). When a rung fails BEFORE
+   *  its first token — the higher layer broke — the request STEPS DOWN to the
+   *  next rung that can serve the model; the work continues, just not as well.
+   *  A rung that dies mid-stream never steps down (the caller already holds
+   *  partial output). The drop is not silent: it lands in the dispatch ledger
+   *  (reason "fell-through", lane = what ACTUALLY served) so the meter counts
+   *  external tokens honestly. Resolves { text, ms, tokens, lane }; rejects
+   *  with { beforeFirstToken } when every rung failed, so the caller answers
+   *  from upstream and counts the drop itself. */
+  async function runOnGiver(model, opts, onToken) {
+    const rungs = [];
+    if (frontierMap.has(model)) rungs.push({ lane: "frontier", run: () => runOnFrontier(model, opts, onToken) });
     const link = linkedGiver(model);
-    if (link) return runOnLink(link, opts, onToken);
-    return runOnFleet({ model, ...opts }, onToken);
+    if (link) rungs.push({ lane: "native", run: () => runOnLink(link, opts, onToken) });
+    rungs.push({ lane: "fleet", run: () => runOnFleet({ model, ...opts }, onToken) });
+    let fell = false;
+    for (const rung of rungs) {
+      try {
+        const out = await rung.run();
+        if (fell) {
+          stats.fellThrough++;
+          recordDispatch(
+            { id: "bridge-" + randomUUID(), taskClass: `bridge.${rung.lane}` },
+            model,
+            "fell-through",
+            { ms: out.ms, inputTokens: 0, outputTokens: out.tokens },
+            rung.lane,
+          );
+          log(`fell through  ${model}: a higher rung broke — ${rung.lane} served`);
+        }
+        return { ...out, lane: rung.lane };
+      } catch (e) {
+        if (!e?.beforeFirstToken) throw e;
+        fell = true;
+        log(`${rung.lane}  ${model}  failed before the first token (${e.message}) — stepping down`);
+      }
+    }
+    const err = new Error("every giver failed before the first token");
+    err.beforeFirstToken = true;
+    throw err;
   }
 
   /** One chat on a configured frontier executor (Anthropic/OpenAI/… wire via
@@ -346,7 +382,6 @@ export function createBridge({
     const ex = frontierMap.get(model);
     const t0 = Date.now();
     const out = await inferOn(ex, { messages, temperature, maxTokens: max_tokens, onToken, fetchImpl: frontierFetch });
-    stats.frontier++;
     recordDispatch(
       { id: "bridge-" + randomUUID(), taskClass: "bridge.frontier", privacy: "sealed-external" },
       `${ex.provider}:${ex.model}`,
@@ -638,9 +673,9 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
           if (stream) res.write(JSON.stringify(line(delta)) + "\n");
         },
       );
-      stats.fleet++;
+      stats[out.lane] = (stats[out.lane] || 0) + 1;
       const ns = out.ms * 1e6;
-      const final = { ...line(stream ? "" : out.text), done: true, done_reason: "stop", total_duration: ns, load_duration: 0, eval_count: out.tokens, eval_duration: ns, heimdall: "fleet" };
+      const final = { ...line(stream ? "" : out.text), done: true, done_reason: "stop", total_duration: ns, load_duration: 0, eval_count: out.tokens, eval_duration: ns, heimdall: out.lane };
       if (stream) { start(); res.end(JSON.stringify(final) + "\n"); }
       else json(res, 200, final);
       log(`fleet  ${b.model}  ${out.tokens} chunks  ${out.ms}ms`);
@@ -685,7 +720,7 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
         { messages, temperature: b.temperature ?? 0.7, max_tokens: b.max_tokens ?? b.max_completion_tokens ?? 1024 },
         (delta) => { start(); if (b.stream) res.write(`data: ${JSON.stringify(chunk({ content: delta }))}\n\n`); },
       );
-      stats.fleet++;
+      stats[out.lane] = (stats[out.lane] || 0) + 1;
       if (b.stream) {
         start();
         res.write(`data: ${JSON.stringify(chunk({}, "stop"))}\n\n`);

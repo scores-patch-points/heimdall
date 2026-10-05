@@ -27,7 +27,8 @@ controller — one browser tab — is the only thing that keeps a horse linked:
    **Landed:** `src/liveness.js`. Standing is derived from the last ping,
    never the channel: ready → stale (3 missed pings, shown, not routable) →
    dead (6 missed, link torn down and re-offered). `isEligible` consults it.
-   Tested in `liveness.test.mjs` (10 cases). The bound the-fold already
+   (The `liveness.test.mjs` once cited here does not exist in the tree;
+   liveness is untested by the automated suite — see ACTIVITIES.md.) The bound the-fold already
    proved for its own mouths — "never convict on absence alone" — is kept:
    a record never heard from is *linking*, not dead.
 
