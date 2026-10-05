@@ -17,6 +17,9 @@
 //   lost     the channel itself closed
 //   expired  the lease lapsed (the worker's own hand renews it)
 //   linking  offered, not yet open
+//   idle     linked and heard, but has NOT accepted duty (no lease yet): shown,
+//            never routed to. A horse is routable only after it said it
+//            accepted (hello/lease carrying leaseMs > 0 or leaseUntil > 0).
 //
 // A silent horse is never convicted on the first missed ping; a dead one is
 // never left in the list forever. Both bounds are stated here and tested.
@@ -32,6 +35,49 @@ export const DEAD_AFTER_MS = 90_000; // 6 missed pings → relink
 // A phone that said it left the app (tab hidden): its timers are throttled
 // and it may be frozen. Held, never routed to, and only given up on after this.
 export const AWAY_HOLD_MS = 30 * 60_000;
+// A link that has been "linking" this long (offered, never opened, no relay
+// fallback either) is a husk, not a slow handshake: a `ready` may drop it.
+export const LINK_STUCK_MS = 30_000;
+
+/* ----------------------------------------------------------------- lease
+   Intended rule (2026-10-05, defect 6):
+   - A horse is routable only after it said it accepted duty: its hello/lease
+     carries leaseMs > 0 (remaining, preferred) or leaseUntil > 0 (absolute).
+     An absent/0 lease means "has not accepted", NEVER "unlimited".
+   - The lease is judged by the REMAINING time the worker reported
+     (`leaseMs`), aged by the controller's own clock since receipt
+     (`rec.leaseAt`) — the phone's clock and the controller's are never
+     compared. Only an old worker that sends the absolute `leaseUntil` alone
+     falls back to comparing clocks, and that comparison tolerates
+     LEASE_SKEW_TOLERANCE_MS of skew before it calls the lease lapsed. */
+export const LEASE_SKEW_TOLERANCE_MS = 60_000;
+
+/** What a worker reports as its lease on the wire: remaining ms (0 = none). */
+export function leaseMsFor(until, now = Date.now()) {
+  return Number.isFinite(until) && until > 0 ? Math.max(0, Math.round(until - now)) : 0;
+}
+
+/** Remaining lease in ms by the controller's reckoning; null = never accepted. */
+export function leaseRemainingMs(rec, now = Date.now()) {
+  const h = rec?.hello;
+  if (!h) return null;
+  const abs = Number.isFinite(h.leaseUntil) && h.leaseUntil > 0;
+  if (Number.isFinite(h.leaseMs) && (h.leaseMs > 0 || abs)) {
+    const at = Number.isFinite(rec.leaseAt) ? rec.leaseAt : now;
+    return h.leaseMs - Math.max(0, now - at);
+  }
+  if (abs) return h.leaseUntil + LEASE_SKEW_TOLERANCE_MS - now;
+  return null;
+}
+
+/** True once the horse has said it accepted duty. */
+export const hasAccepted = (rec) => leaseRemainingMs(rec, 0) != null;
+
+/** True when the horse accepted and its lease has since lapsed. */
+export function leaseLapsed(rec, now = Date.now()) {
+  const rem = leaseRemainingMs(rec, now);
+  return rem != null && rem <= 0;
+}
 
 /** Derive a worker's standing from evidence the controller already keeps.
  *  `rec.lastSeen` is the last ping/hello/lease/result; null = never heard
@@ -40,19 +86,33 @@ export function standingOf(rec, now = Date.now()) {
   if (!rec) return "lost";
   if (rec.status === "lost") return "lost";
   if (!rec.peer?.opened) return "linking";
-  if (rec.hello?.leaseUntil && now > rec.hello.leaseUntil) return "expired";
-  if (rec.lastSeen == null) return rec.hello ? "ready" : "linking";
+  if (leaseLapsed(rec, now)) return "expired";
+  const calm = hasAccepted(rec) ? "ready" : "idle";
+  if (rec.lastSeen == null) return rec.hello ? calm : "linking";
   const silent = now - rec.lastSeen;
   if (rec.hidden) return silent >= AWAY_HOLD_MS ? "dead" : "away";
   if (silent >= DEAD_AFTER_MS) return "dead";
   if (silent >= STALE_AFTER_MS) return "stale";
-  return rec.hello ? "ready" : "linking";
+  return rec.hello ? calm : "linking";
 }
 
 /** True when the controller should tear the link down and re-offer. */
 export function shouldRelink(rec, now = Date.now()) {
   const s = standingOf(rec, now);
   return s === "dead" || s === "lost";
+}
+
+/** A `ready` announcement arrived from this horse: should the controller drop
+ *  its record and re-offer? Only a genuine husk — dead, lost, or linking so
+ *  long it is stuck — and never one with a job in flight. A hidden (away),
+ *  expired or merely stale horse is alive: dropping it would defeat
+ *  AWAY_HOLD and churn the link (defect 1). */
+export function shouldDropOnReady(rec, now = Date.now(), { jobInFlight = false } = {}) {
+  if (!rec || jobInFlight) return false;
+  const s = standingOf(rec, now);
+  if (s === "dead" || s === "lost") return true;
+  if (s === "linking") return Number.isFinite(rec.createdAt) && now - rec.createdAt >= LINK_STUCK_MS;
+  return false;
 }
 
 /** True when a job may be routed to this worker: heard recently, channel

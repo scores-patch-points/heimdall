@@ -34,7 +34,8 @@ export function loadLinks(file = DEFAULT_LINKS_FILE) {
 }
 
 export function saveLinks(links, file = DEFAULT_LINKS_FILE) {
-  const clean = (Array.isArray(links) ? links : []).filter((l) => l && l.url);
+  // lastFailAt is runtime health, never persisted
+  const clean = (Array.isArray(links) ? links : []).filter((l) => l && l.url).map(({ lastFailAt, ...rest }) => rest);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify({ links: clean }, null, 2));
   return clean;
@@ -65,6 +66,11 @@ export function normalizeUrl(raw) {
   } catch {
     return null;
   }
+}
+
+/** Link-local / cloud-metadata addresses (169.254.0.0/16, fd00:ec2::254) are never a native host. */
+export function isMetadataHost(url) {
+  try { const h = new URL(url).hostname.toLowerCase(); return /^169\.254\./.test(h) || /^\[?fd00:ec2::/.test(h) || h === "metadata.google.internal"; } catch { return true; }
 }
 
 /** From a probe's JSON, what wire is it and which models does it list. */
@@ -111,12 +117,18 @@ export function linkAdvertisedModels(link) {
   return [...new Set([link?.tag, link?.model, ...(link?.models || [])].filter(Boolean).map(String))];
 }
 
-/** Which link answers a requested Ollama model name, or null. Pure. */
-export function resolveLink(links, model) {
+/** A link that failed before its first token this recently is skipped (it is not asked again until the window passes). */
+export const LINK_SKIP_MS = 30_000;
+
+/** Which link answers a requested Ollama model name, or null. A link whose
+ *  `lastFailAt` is inside the skip window is passed over, so a dead native
+ *  host costs one bounded failure per window, not one per request. Pure. */
+export function resolveLink(links, model, { now = Date.now(), skipMs = LINK_SKIP_MS } = {}) {
   const want = model == null ? null : normalizeTag(model);
   const any = model === "any" || model === "fleet";
   for (const l of links || []) {
     if (!l?.url) continue;
+    if (l.lastFailAt && now - l.lastFailAt < skipMs) continue;
     if (any) return l;
     if (l.tag && normalizeTag(l.tag) === want) return l;
     if ((l.models || []).some((m) => normalizeTag(m) === want)) return l;
@@ -139,6 +151,7 @@ async function getJson(url, { fetchImpl, timeoutMs, key }) {
 export async function probeEndpoint(rawUrl, { fetchImpl = fetch, timeoutMs = 4000, key = null } = {}) {
   const url = normalizeUrl(rawUrl);
   if (!url) return { ok: false, url: null, error: "not a valid address" };
+  if (isMetadataHost(url)) return { ok: false, url, error: "that address is a cloud-metadata endpoint, not a model server" };
   let tags = null;
   let models = null;
   let err = null;

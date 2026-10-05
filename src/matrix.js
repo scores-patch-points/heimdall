@@ -37,6 +37,13 @@ export function aliasTaken(e) {
   return /in use|taken|already/.test(m);
 }
 
+/** Options for client.initRustCrypto. Default = the per-account IndexedDB
+ *  store (browser); memoryCrypto = no IndexedDB (Node / headless). */
+export function cryptoInitOptions({ cryptoPrefix, memoryCrypto = false } = {}) {
+  if (memoryCrypto) return { useIndexedDB: false };
+  return cryptoPrefix ? { cryptoDatabasePrefix: cryptoPrefix } : {};
+}
+
 export function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -99,16 +106,17 @@ export class MatrixPeer {
     });
   }
 
-  async start() {
+  /** `memoryCrypto: true` keeps the Rust crypto store in memory instead of
+   *  IndexedDB — opt-in for Node (no indexedDB there) and headless controllers;
+   *  the browser default is unchanged. */
+  async start({ memoryCrypto = false } = {}) {
     // Scope the IndexedDB crypto store to this account. The default prefix is
     // shared by every Matrix app on the same origin, which makes
     // "the account in the store doesn't match the account in the constructor"
     // blow up the moment two accounts (or two Matrix apps, like the fold)
     // touch the same browser. A per-account store means reusing the account
     // you're already logged in with just works.
-    await this.client.initRustCrypto(
-      this.cryptoPrefix ? { cryptoDatabasePrefix: this.cryptoPrefix } : {},
-    );
+    await this.client.initRustCrypto(cryptoInitOptions({ cryptoPrefix: this.cryptoPrefix, memoryCrypto }));
     await this.client.startClient({ initialSyncLimit: 0 });
   }
 

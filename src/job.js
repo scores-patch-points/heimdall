@@ -111,6 +111,36 @@ export const EFFECTS = Object.freeze([
 
 export const PROTOCOLS = Object.freeze(["native-tools", "door-grammar", "door-text"]);
 
+/** DISCLOSURE — what may leave the machine for this job (2026-10, escalation
+ *  design). Ordered from least to most permissive; a route's exposure may never
+ *  exceed the job's disclosure, and escalation never raises the job's.
+ *    none                   nothing leaves this machine
+ *    abstract-capsule-only  only a precompiled sealed capsule (opaque symbols +
+ *                           formal relations; src/capsule.js) may leave
+ *    sealed-external-text   a sealed text projection may leave (the older
+ *                           `privacy: "sealed-external"` meaning) */
+export const DISCLOSURE = Object.freeze(["none", "abstract-capsule-only", "sealed-external-text"]);
+
+/** Rank of a disclosure level (0 = none). -1 for an unknown level, which no
+ *  comparison ever treats as permissive. */
+export const disclosureRank = (d) => DISCLOSURE.indexOf(d);
+
+/** The job's disclosure: explicit when declared, else derived from the older
+ *  `privacy` field so every pre-existing job keeps its meaning. */
+export function disclosureOf(job) {
+  if (job?.disclosure != null) return job.disclosure;
+  return job?.privacy === "local-raw" ? "none" : "sealed-external-text";
+}
+
+/** The typed acceptance checks the Fold runs LOCALLY on a returned proposal
+ *  (src/acceptance.js). A remote result is a proposal until these pass. */
+export const CHECK_TYPES = Object.freeze(["schema", "equation", "constraint", "contradiction-free", "citation-resolves", "custom"]);
+
+/** The only observable failure kinds that may trigger an escalation
+ *  (src/escalation.js). A model's self-reported confidence is not on this list
+ *  and never can be. */
+export const FAILURE_KINDS = Object.freeze(["check_failed", "contradiction", "unresolved", "capability_missing", "deadline_risk", "route_error"]);
+
 export function isTaskClass(name) {
   return Object.hasOwn(TASK_CLASSES, name);
 }
@@ -181,6 +211,10 @@ export function makeJob({
   model = null,
   deadlineMs = null,
   qualityFloor = null,
+  task = null,
+  disclosure = null,
+  acceptance = [],
+  maxAttempts = 3,
 } = {}) {
   return {
     schema: SCHEMA,
@@ -196,6 +230,13 @@ export function makeJob({
     model,
     deadlineMs,
     qualityFloor,
+    // escalation design (2026-10): what needs solving, what may leave, and the
+    // machine-checkable acceptance the Fold runs locally. `disclosure` defaults
+    // from `privacy`, so jobs built before it existed are unchanged.
+    task,
+    disclosure: disclosure ?? (privacy === "local-raw" ? "none" : "sealed-external-text"),
+    acceptance,
+    maxAttempts,
   };
 }
 
@@ -215,5 +256,22 @@ export function validateJob(job) {
     errors.push("structured output requires the structured-output capability");
   }
   for (const p of job.protocols || []) if (!PROTOCOLS.includes(p)) errors.push(`unknown protocol ${p}`);
+  if (job.disclosure != null) {
+    if (!DISCLOSURE.includes(job.disclosure)) errors.push(`disclosure must be one of ${DISCLOSURE.join("|")}`);
+    // A local-raw job may be read raw only inside the trust domain, so it can
+    // never carry a permission to leave: the two declarations must agree.
+    else if (job.privacy === "local-raw" && job.disclosure !== "none") errors.push("a local-raw job cannot declare a disclosure above none");
+  }
+  if (job.acceptance != null) {
+    if (!Array.isArray(job.acceptance)) errors.push("acceptance must be an array of typed checks");
+    else job.acceptance.forEach((c, i) => {
+      if (!c || typeof c !== "object" || !CHECK_TYPES.includes(c.type)) errors.push(`acceptance[${i}].type must be one of ${CHECK_TYPES.join("|")}`);
+      else if (c.type === "custom" && !(typeof c.fn === "string" && c.fn)) errors.push(`acceptance[${i}] custom check needs a fn id`);
+      else if (c.type === "schema" && !(c.schema && typeof c.schema === "object")) errors.push(`acceptance[${i}] schema check needs a schema`);
+      else if (c.type === "equation" && !(Array.isArray(c.statements) && c.statements.length)) errors.push(`acceptance[${i}] equation check needs statements`);
+      else if (c.type === "constraint" && !(Array.isArray(c.constraints) && c.constraints.length)) errors.push(`acceptance[${i}] constraint check needs constraints`);
+    });
+  }
+  if (job.maxAttempts != null && !(Number.isInteger(job.maxAttempts) && job.maxAttempts >= 1 && job.maxAttempts <= 10)) errors.push("maxAttempts must be an integer 1..10");
   return errors.length ? { ok: false, errors } : { ok: true, errors: [] };
 }

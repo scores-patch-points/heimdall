@@ -13,12 +13,14 @@ import { RtcPeer, RelayPeer } from "./rtc.js";
 // A direct link that has not opened by now falls back to the Matrix relay.
 const RELAY_AFTER_MS = 10_000;
 import { WorkerEngine, OllamaEngine, WasmEngine, MODEL_CHOICES, DEFAULT_MODEL, FALLBACK_MODEL, webgpuAvailable } from "./llm.js";
+import { SharedEngine } from "./engine-share.js";
 import { answers, ollamaTagOf } from "./models.js";
 import { detectBridge, connectBridge } from "./bridge-client.js";
 import qrcode from "qrcode-generator";
 import { isEligible, modelOf, pickGiver as routePickGiver, observe as routeObserve, markSent as routeMarkSent, isRoomMouth, mergeInflight, mergeMeanMs, electLeader, SIBLING_TTL_MS } from "./route.js";
 import { amAlly, servesOf, pruneControllers, pickForwarder, makeFwdJob, validFwdJob, controllerKey, CONTROLLER_TTL_MS, FWD_TTL } from "./swarm.js";
-import { standingOf, shouldRelink, isRevoked } from "./liveness.js";
+import { standingOf, shouldRelink, shouldDropOnReady, isRevoked, hasAccepted, leaseLapsed, leaseMsFor, revokeEntry, withRevoked } from "./liveness.js";
+import { retryWithBackoff, InflightDeadlines, TimerBag, restartInterval, withTimeout, mapBounded, membersToQuery, revokedWorkerKeys, mergeRevoked } from "./controller-core.js";
 import { el, statusDot, copyBtn, toast, deviceName, publicIp, countdownText } from "./ui.js";
 import {
   generateDeviceKeyPair,
@@ -100,7 +102,14 @@ const app = {
   leaseExpired: false,
   renewRequested: false,
   myIp: null,
-  timers: [],
+  timers: new TimerBag(), // one-shot timers that remove themselves when they fire
+  slots: {}, // named setIntervals (worker ready/ping): restarted, never stacked
+  matrixPromise: null, // an in-flight ensureMatrix start, shared by concurrent callers
+  fleetGen: 0, // bumps on every createRoom/rejoin: a newer call supersedes an older retry loop
+  reconciling: false,
+  reconcileAgain: false,
+  revokedOk: false, // the account registry has been read successfully at least once
+  revokedPending: [], // revocations whose registry write failed: still enforced here
   pendingVerify: null,
   ledger: new Map(), // deviceKey -> { give, borrow }
   relay: new Map(), // job id -> { giverKey, borrowerKey, borrowerRec, t0, model }
@@ -132,6 +141,8 @@ const app = {
 
 const REVOKED_REFRESH_MS = 60_000;
 const HEARD_WITHIN_MS = 10 * 60_000;
+const DEVICES_LOOKUP_CONCURRENCY = 4; // reconcile's devicesOf calls in flight at once
+const DEVICES_LOOKUP_TIMEOUT_MS = 10_000; // one slow member never stalls the tick
 
 /* ---------------------------------------------------------------- storage */
 
@@ -163,6 +174,17 @@ function randomBytes() {
 
 async function ensureMatrix() {
   if (app.matrix) return app.matrix;
+  // Concurrent callers share one start; a failed start clears the slot so the
+  // next call (or the retry loop) begins again from scratch.
+  if (!app.matrixPromise) {
+    app.matrixPromise = startMatrix().finally(() => { app.matrixPromise = null; });
+  }
+  const matrix = await app.matrixPromise;
+  await resolveShortInvite(matrix);
+  return matrix;
+}
+
+async function startMatrix() {
   let creds = app.session?.creds;
   if (!creds) {
     const password = randomBytes();
@@ -189,8 +211,19 @@ async function ensureMatrix() {
       }
     },
   });
+  // Publish app.matrix only once start() succeeded: a half-started peer must
+  // not be handed out as ready (ensureMatrix would return it forever).
+  try {
+    await matrix.start();
+  } catch (e) {
+    try { matrix.client?.stopClient?.(); } catch {}
+    throw e;
+  }
   app.matrix = matrix;
-  await matrix.start();
+  return matrix;
+}
+
+async function resolveShortInvite(matrix) {
   // A short invite (`?r=<code>`) names no room: resolve the code — the room's
   // local alias — to the fleet room before anything else. host/name/exp ride
   // nothing in the short link, so identity is checked against the room's
@@ -362,13 +395,16 @@ async function onSignal(senderUserId, content) {
     if (rec && content.hidden != null) rec.hidden = !!content.hidden;
     if (rec && content.hwid && rec.hwid !== content.hwid) { rec.hwid = content.hwid; retireOtherSessions(key, content.hwid); }
     if (rec?.peer?.relay && rec.peer.opened && !rec.hello) {
-      rec.hello = { model: content.model ?? null, name: content.name, leaseUntil: content.leaseUntil, queueDepth: content.queueDepth ?? 0 };
+      rec.hello = { model: content.model ?? null, name: content.name, leaseUntil: content.leaseUntil, leaseMs: content.leaseMs, queueDepth: content.queueDepth ?? 0 };
+      rec.leaseAt = Date.now();
       rec.status = "ready";
       rec.lastSeen = Date.now();
       renderFleet();
       return;
     }
-    if (rec && standingOf(rec) !== "ready" && standingOf(rec) !== "linking") dropWorker(key);
+    // Only a genuine husk (dead / lost / stuck linking) is dropped: a hidden,
+    // expired or stale horse is alive, and an in-flight job must finish.
+    if (shouldDropOnReady(rec, Date.now(), { jobInFlight: jobInFlight(key) })) dropWorker(key);
     reconcile();
   } else if (content.type === "revoked" && mode === "worker") {
     // Courtesy notice from the host (creator only); the room membership
@@ -544,40 +580,45 @@ function shortShareUrl() {
   });
 }
 
+/** Bring the fleet up, retrying with backoff (2s .. 60s) until it works: a
+ *  failed createRoom/rejoin used to leave startReconcile unrun until reload.
+ *  A newer call supersedes an older loop; `fatal` errors stop it. */
+async function bringUpFleet(label, step, { fatal = () => false } = {}) {
+  const gen = ++app.fleetGen;
+  const done = await retryWithBackoff(step, {
+    shouldStop: () => app.fleetGen !== gen,
+    isFatal: fatal,
+    onError: (e, n) => toast(`could not ${label}: ${e.message}${n === 0 ? " — retrying" : ""}`),
+  });
+  if (!done.ok) return false;
+  fleetCardEl.hidden = false;
+  promptCardEl.hidden = false;
+  refreshShareBox();
+  startReconcile();
+  try { await reconcile(); } catch {}
+  return true;
+}
+
 async function createRoom() {
-  try {
+  await bringUpFleet("create room", async () => {
     const matrix = await ensureMatrix();
     const roomId = await matrix.createFleetRoom();
     saveSession({ roomId });
     app.roomId = roomId;
-    fleetCardEl.hidden = false;
-    promptCardEl.hidden = false;
-    refreshShareBox();
     toast("fleet room ready — send the link");
-    startReconcile();
-    await reconcile();
-  } catch (e) {
-    toast(`could not create room: ${e.message}`);
-  }
+  });
 }
 
 async function rejoin() {
   if (!app.session?.roomId) return;
-  try {
+  await bringUpFleet("rejoin", async () => {
     const matrix = await ensureMatrix();
     await matrix.joinRoom(app.session.roomId);
     app.roomId = app.session.roomId;
     await matrix.ensureEncrypted();
     await matrix.restoreAlias();
-    fleetCardEl.hidden = false;
-    promptCardEl.hidden = false;
-    refreshShareBox();
     toast("rejoined fleet");
-    startReconcile();
-    await reconcile();
-  } catch (e) {
-    toast(`could not rejoin: ${e.message}`);
-  }
+  }, { fatal: (e) => e?.errcode === "M_FORBIDDEN" || e?.errcode === "M_UNKNOWN_TOKEN" });
 }
 
 /* ------------------------------------------------ the local bridge ----
@@ -640,7 +681,7 @@ function bridgeState() {
     standing: standingOf(rec, now),
     // Routable only once the phone has tapped Start (a live lease) and says
     // which weights are actually loaded.
-    ready: isEligible(rec, now) && !!modelOf(rec) && (rec.hello?.leaseUntil ?? 0) > now,
+    ready: isEligible(rec, now) && !!modelOf(rec), // isEligible already requires an accepted, unlapsed lease
     // The same worker-reported backlog route.js already ranks givers by
     // (rec.queueDepth, from the phone's own WorkerEngine.pending) — the
     // bridge needs it too, to answer callers honestly instead of "ready".
@@ -707,12 +748,16 @@ function renderBridge() {
   );
 }
 
+// WebLLM is the default engine, and there is ONE per browser: the first tab builds it and the others proxy to it
+// (engine-share.js). Weights are already shared through Cache Storage; this makes the engine itself shared too.
+const newWebllmEngine = (onProgress) => new SharedEngine({ onProgress, makeEngine: (cb) => new WorkerEngine(cb) });
+
 async function lendMyDevice() {
   if (app.lendDevice) return;
   app.lendDevice = true;
   lendBtnEl.disabled = true;
   lendStatusEl.textContent = "loading model…";
-  app.hubEngine = new WorkerEngine((p) => {
+  app.hubEngine = newWebllmEngine((p) => {
     lendStatusEl.textContent = p.text || `loading model ${Math.round((p.progress || 0) * 100)}%`;
   });
   try {
@@ -739,8 +784,14 @@ async function refreshRevoked(force = false) {
   if (!app.session?.creds) return app.revoked;
   if (!force && Date.now() - app.revokedAt < REVOKED_REFRESH_MS) return app.revoked;
   try {
-    app.revoked = await revokedList({ creds: app.session.creds });
+    // revokedList THROWS on a failed read (invite.js): the last list is kept
+    // and revokedAt stays put, so the very next reconcile reads again.
+    const fresh = await revokedList({ creds: app.session.creds });
+    // A revocation this tab made whose registry write failed is still enforced.
+    app.revokedPending = app.revokedPending.filter((p) => !isRevoked(fresh, p));
+    app.revoked = mergeRevoked(fresh, app.revokedPending);
     app.revokedAt = Date.now();
+    app.revokedOk = true;
   } catch { /* keep the last list; never re-offer on a failed read */ }
   // Own devices ride the same account read, so a pairing made on another
   // surface (or before a reload) still borrows freely here.
@@ -768,20 +819,48 @@ function jobInFlight(key) {
   return (app.route.inflight[key] ?? 0) > 0;
 }
 
+/** One reconcile at a time; a call that lands mid-run schedules exactly one more. */
 async function reconcile() {
   if (!app.matrix || !app.roomId) return;
+  if (app.reconciling) { app.reconcileAgain = true; return; }
+  app.reconciling = true;
+  try {
+    do {
+      app.reconcileAgain = false;
+      await reconcileOnce();
+    } while (app.reconcileAgain);
+  } finally {
+    app.reconciling = false;
+  }
+}
+
+async function reconcileOnce() {
+  if (!app.matrix || !app.roomId) return;
   await refreshRevoked();
+  // Revocation gates what is ALREADY linked, not just new offers: a revoked
+  // horse is dropped (link closed, record gone, so it is unrouted) now.
+  for (const key of revokedWorkerKeys(app.workers, app.revoked, isRevoked)) dropWorker(key);
+  // Never read the registry successfully (the read failed): offering links now
+  // would fail OPEN. Hold offers until one read lands; the next tick retries.
+  const registryUnknown = !!app.session?.creds && !app.revokedOk;
   // Ally mode: this room belongs to another account, so its workers will
   // never answer our offers (they serve their creator's devices only).
   // Don't storm them — contribute the lent device, accept forwards.
   const ally = amAlly({ creatorId: app.matrix.roomCreator(), userId: app.matrix.userId });
   app.ally = ally;
-  if (!ally) {
+  if (!ally && !registryUnknown) {
     // Your own account's other devices count too: a phone signed into the
     // same account as this computer is the plainest pairing there is.
-    const members = [...app.matrix.roomMembers(), app.matrix.userId];
-    for (const userId of members) {
-      const devs = await app.matrix.devicesOf(userId, { retry: 0 });
+    // Only members with a device heard recently can yield an offer (the
+    // heard filter below), so only they are looked up — in parallel, capped,
+    // each with its own timeout, instead of serially for the whole room.
+    const members = membersToQuery([...app.matrix.roomMembers(), app.matrix.userId], app.heard, Date.now(), HEARD_WITHIN_MS);
+    const found = await mapBounded(
+      members,
+      async (userId) => ({ userId, devs: await withTimeout(app.matrix.devicesOf(userId, { retry: 0 }), DEVICES_LOOKUP_TIMEOUT_MS, []) }),
+      DEVICES_LOOKUP_CONCURRENCY,
+    );
+    for (const { userId, devs } of found) {
       for (const device of devs) {
         if (userId === app.matrix.userId && String(device.deviceId) === String(app.matrix.deviceId)) continue; // this page
         if (app.controllers.has(deviceKey(device))) continue; // another heimdall, not a horse
@@ -884,6 +963,7 @@ function ensureWorkerLink(key, device) {
     hello: null,
     lastSeen: null,
     renewed: false,
+    createdAt: Date.now(), // a link still "linking" long after this is a husk (liveness.js LINK_STUCK_MS)
   };
   app.workers.set(key, rec);
   renderFleet();
@@ -901,7 +981,7 @@ function ensureWorkerLink(key, device) {
     onClose: () => {
       rec.status = "lost";
       renderFleet();
-      const retry = setTimeout(() => {
+      app.timers.later(() => {
         // Only reap OUR record: a relink may already hold a new one under
         // this key (dropWorker + reconcile run inside 5s).
         if (app.workers.get(key) !== rec || rec.peer !== peer) return; // swapped to the relay: not ours to reap
@@ -909,7 +989,6 @@ function ensureWorkerLink(key, device) {
         app.connecting.delete(key);
         reconcile();
       }, 5000);
-      app.timers.push(retry);
     },
     onMessage: (msg) => onWorkerMessage(key, rec, msg),
   });
@@ -918,7 +997,7 @@ function ensureWorkerLink(key, device) {
     app.workers.delete(key);
     app.connecting.delete(key);
   });
-  const fallback = setTimeout(() => {
+  app.timers.later(() => {
     if (app.workers.get(key) !== rec || rec.peer !== peer || peer.opened) return;
     peer.onClose = () => {};
     peer.close();
@@ -932,7 +1011,6 @@ function ensureWorkerLink(key, device) {
     app.matrix.sendSignalRetry(device, { type: "relay-open", deviceId: app.matrix.deviceId }, 3).catch(() => {});
     renderFleet();
   }, RELAY_AFTER_MS);
-  app.timers.push(fallback);
 }
 
 function selfGiver() {
@@ -983,13 +1061,15 @@ function onWorkerMessage(key, rec, msg) {
   }
   if (msg.type === "hello") {
     rec.hello = msg;
+    rec.leaseAt = Date.now(); // msg.leaseMs (remaining) is aged from here, on OUR clock
     rec.status = "ready";
     rec.lastSeen = Date.now();
     rec.queueDepth = Number.isFinite(msg.queueDepth) && msg.queueDepth > 0 ? msg.queueDepth : 0;
     pushCredit(key, ledgerOf(key)); // tells an own device it may borrow now
     renderFleet();
   } else if (msg.type === "lease") {
-    rec.hello = { ...(rec.hello || {}), leaseUntil: msg.until };
+    rec.hello = { ...(rec.hello || {}), leaseUntil: msg.until, leaseMs: msg.leaseMs };
+    rec.leaseAt = Date.now();
     rec.renewed = true;
     rec.status = "ready";
     rec.lastSeen = Date.now();
@@ -1008,7 +1088,9 @@ function onWorkerMessage(key, rec, msg) {
     // A broadcast run's tokens land in the worker's own stream block, so
     // "run on all" stays readable instead of one interleaved soup.
     pushRunToken(msg.id, key, msg.text);
+    app.deadlines.touch(key, msg.id); // a streaming horse is alive: re-arm its deadline
   } else if (msg.type === "result") {
+    app.deadlines.settle(key, msg.id);
     finishRunStream(msg.id, key, `[done ${msg.duration_ms}ms]`, true);
     rec.lastSeen = Date.now();
     noteObserved(key, msg.duration_ms ?? null, true);
@@ -1019,6 +1101,7 @@ function onWorkerMessage(key, rec, msg) {
     pushCredit(key, l);
     renderFleet();
   } else if (msg.type === "error") {
+    app.deadlines.settle(key, msg.id);
     finishRunStream(msg.id, key, `[error] ${msg.message}`, false);
     // A model_mismatch here means the broadcast label drifted or the
     // worker swapped models mid-lease — free the slot, keep the mean.
@@ -1055,6 +1138,18 @@ function settle(giverKey, borrowerKey) {
 }
 
 const JOB_TIMEOUT_MS = 120_000;
+
+// A broadcast job sent to a horse that then dies would hold its inflight slot
+// (and jobInFlight, which blocks the relink) forever: silence for
+// JOB_TIMEOUT_MS clears it, the same bound the relayed jobs use.
+app.deadlines = new InflightDeadlines({
+  ms: JOB_TIMEOUT_MS,
+  onExpire: (key, id) => {
+    noteObserved(key, null, false);
+    finishRunStream(id, key, "[timed out — no word from this horse]", false);
+    renderFleet();
+  },
+});
 
 function onBorrowJob(borrowerKey, rec, msg) {
   const l = ledgerOf(borrowerKey);
@@ -1451,6 +1546,11 @@ async function removeWorker(key, { ban = false, reason = "" } = {}) {
       app.revokedAt = Date.now();
       await forgetPairedKey({ creds, userId, deviceId: ban ? null : deviceId });
     } catch (e) {
+      // The registry read/write failed: still enforce it here (reconcile drops
+      // it at the next tick) and keep it until a later read sees it saved.
+      const entry = revokeEntry({ userId, deviceId: ban ? null : deviceId, reason: why });
+      app.revokedPending = withRevoked(app.revokedPending, entry);
+      app.revoked = withRevoked(app.revoked, entry);
       toast(`revoked locally, but the account registry did not save: ${e.message}`);
     }
   }
@@ -1496,7 +1596,7 @@ function sendInferAll() {
   // tracked so the next borrowed job sees the real load.
   let sent = 0;
   for (const [wkey, rec] of app.workers) {
-    if (rec.peer?.opened && rec.status !== "expired" && !(rec.hello?.leaseUntil && Date.now() > rec.hello.leaseUntil)) {
+    if (rec.peer?.opened && rec.status !== "expired" && hasAccepted(rec) && !leaseLapsed(rec)) {
       rec.peer.send({
         type: "infer",
         id,
@@ -1507,6 +1607,7 @@ function sendInferAll() {
         max_tokens: 1024,
       });
       app.route.inflight = routeMarkSent(app.route.inflight, wkey);
+      app.deadlines.arm(wkey, id);
       openRunStream(id, wkey, rec.hello?.name || rec.device.userId, rec.hello?.model ?? null);
       sent++;
     }
@@ -1700,14 +1801,14 @@ async function acceptDuty() {
     app.renewRequested = false;
     localStorage.setItem(`heimdall.lease.${app.roomId}`, String(app.leaseUntil));
     for (const peer of app.peers.values()) {
-      if (peer.opened) peer.send({ type: "lease", until: app.leaseUntil, queueDepth: app.engine?.pending ?? 0 });
+      if (peer.opened) peer.send({ type: "lease", until: app.leaseUntil, leaseMs: leaseMsFor(app.leaseUntil), queueDepth: app.engine?.pending ?? 0 });
     }
     statusEl.textContent = `Standing by until ${countdownText(app.leaseUntil)}`;
     acceptBtnEl.textContent = "Renew compute duties";
 
     await announceReady();
-    setInterval(() => announceReady(), 20000);
-    setInterval(() => {
+    restartInterval(app.slots, "ready", () => announceReady(), 20000);
+    restartInterval(app.slots, "ping", () => {
       for (const peer of app.peers.values()) {
         if (peer.opened) {
           peer.send({
@@ -1780,7 +1881,7 @@ async function prefetchModel() {
     return;
   }
   if (!app.engine) {
-    app.engine = new WorkerEngine((p) => {
+    app.engine = newWebllmEngine((p) => {
       if (p.progress > 0 && p.progress < 1) progressEl.hidden = false;
       progressFillEl.style.width = `${Math.round((p.progress || 0) * 100)}%`;
       const pct = Math.round((p.progress || 0) * 100);
@@ -1918,6 +2019,7 @@ async function announceReady() {
         queueDepth: app.engine?.pending ?? 0,
         name: deviceName(),
         leaseUntil: app.leaseUntil,
+        leaseMs: leaseMsFor(app.leaseUntil), // remaining, judged on the controller's clock not ours
       },
       3,
     );
@@ -2001,6 +2103,7 @@ function workerHello() {
     name: deviceName(),
     ua: navigator.userAgent,
     leaseUntil: app.leaseUntil,
+    leaseMs: leaseMsFor(app.leaseUntil),
   };
 }
 
@@ -2026,6 +2129,7 @@ function ensureWorkerPeer(remoteDevice) {
         name: deviceName(),
         ua: navigator.userAgent,
         leaseUntil: app.leaseUntil,
+        leaseMs: leaseMsFor(app.leaseUntil),
       });
     },
     onClose: () => renderWorkerStatus(),
@@ -2564,7 +2668,7 @@ function renderFleet() {
   for (const [key, rec] of app.workers) {
     const h = rec.hello;
     const standing = standingOf(rec);
-    const color = standing === "ready" ? "ok" : standing === "stale" || standing === "linking" || standing === "away" ? "warn" : "err";
+    const color = standing === "ready" ? "ok" : standing === "stale" || standing === "linking" || standing === "away" || standing === "idle" ? "warn" : "err";
     const name = h?.name || rec.device.userId;
     const queue = rec.queueDepth ? ` · queued ${rec.queueDepth}` : "";
     const pace = app.route.meanMs[key] ? ` · ~${Math.round(app.route.meanMs[key] / 100) / 10}s avg` : "";
@@ -2926,7 +3030,7 @@ function controllerTick() {
   const now = Date.now();
   let changed = false;
   for (const [key, rec] of app.workers) {
-    if (rec.hello?.leaseUntil && now > rec.hello.leaseUntil && rec.status !== "expired") {
+    if (leaseLapsed(rec, now) && rec.status !== "expired") {
       rec.status = "expired";
       nudgeRenew(key);
       changed = true;

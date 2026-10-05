@@ -41,17 +41,23 @@ export function record({ job, selected, reason, candidates = [], actual = null, 
 export function meter(entries, { frontierCost = null, rawContextCost = null } = {}) {
   const counts = { "deterministic/local": 0, "open remote": 0, frontier: 0 };
   let externalTokens = 0;
+  let externalInputTokens = 0;
+  let rungFailed = 0;
   for (const e of entries) {
+    // A rung that failed before its first token served nothing: it is on the record, never in a lane's count or token total.
+    if (e.reason === "rung-failed") { rungFailed++; continue; }
     const lane = e._lane || laneOf(e);
     if (counts[lane] == null) counts[lane] = 0;
     counts[lane]++;
-    if (lane !== "deterministic/local") externalTokens += e.actual?.outputTokens ?? 0;
+    if (lane !== "deterministic/local") { externalTokens += e.actual?.outputTokens ?? 0; externalInputTokens += e.actual?.inputTokens ?? 0; }
   }
   const frontierEstimated = frontierCost != null ? Math.round(externalTokens * frontierCost) : null;
   const rawEstimated = rawContextCost != null ? Math.round(externalTokens * rawContextCost) : null;
   return {
     counts,
     externalTokens, // exact — measured, not an estimate
+    externalInputTokens, // exact when the provider reported usage; 0 where it did not
+    rungFailed, // failed rungs on the record (steps down), never counted as served
     estimated: {
       frontierEverything: frontierEstimated,
       conventionalRawContext: rawEstimated,
@@ -64,7 +70,7 @@ function laneOf(e) {
   if (e._lane) return e._lane;
   const s = String(e.selected ?? "");
   if (/anthropic|openai|claude/.test(s)) return "frontier";
-  if (/groq|openrouter|mistral|cohere|google|cloudflare|huggingface|puter|together|cerebras/.test(s)) return "open remote";
+  if (/groq|openrouter|mistral|cohere|google|cloudflare|huggingface|puter|together|cerebras|vertex/.test(s)) return "open remote";
   return "deterministic/local";
 }
 

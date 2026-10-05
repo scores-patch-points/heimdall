@@ -33,7 +33,30 @@
       "description": "Action modes the executor may use; native-tools is an optimization, never a requirement (spec §5)."
     },
     "model": { "type": ["string", "null"], "description": "Explicit pin only — set when a user pins a model, never by default." },
-    "deadlineMs": { "type": ["integer", "null"] }
+    "deadlineMs": { "type": ["integer", "null"] },
+    "qualityFloor": { "type": ["number", "null"] },
+    "task": { "type": ["string", "null"], "description": "Plain statement of what needs solving (escalation design 2026-10; docs/ESCALATION.md)." },
+    "disclosure": {
+      "enum": ["none", "abstract-capsule-only", "sealed-external-text"],
+      "description": "What may leave this machine for the job, least to most permissive. Defaults from `privacy` (local-raw -> none, sealed-external -> sealed-external-text). A route's exposure may never exceed it, and escalation never raises it."
+    },
+    "acceptance": {
+      "type": "array",
+      "description": "Typed checks the Fold runs LOCALLY on a returned proposal; the proposal becomes `accepted` only when all pass (src/acceptance.js).",
+      "items": {
+        "type": "object",
+        "required": ["type"],
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "enum": ["schema", "equation", "constraint", "contradiction-free", "citation-resolves", "custom"] },
+          "schema": { "type": "object" },
+          "statements": { "type": "array", "items": { "type": "string" } },
+          "constraints": { "type": "array" },
+          "fn": { "type": "string", "description": "custom check function id" }
+        }
+      }
+    },
+    "maxAttempts": { "type": "integer", "minimum": 1, "maximum": 10 }
   },
   "additionalProperties": false,
   "falsifyingControl": "a job whose effects do not cover every required Door's effect, or a sealed-external job whose requires contains an operation that cannot be projected, contradicts the contract"

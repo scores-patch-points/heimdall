@@ -18,6 +18,7 @@
 // Pure data + pure transitions; no network here (see discovery.js).
 
 import { AUTH_CLASSES } from "./auth-class.js";
+import { VERTEX_DEFAULT_MODELS, VERTEX_NOTE, vertexConfig } from "./vertex.js";
 
 /** The two discovery surfaces a provider may expose. */
 export const DISCOVERY = Object.freeze({
@@ -38,6 +39,7 @@ const PROVIDER_ENDPOINTS = Object.freeze({
   huggingface: { kind: "openai", base: "https://router.huggingface.co/v1" },
   openai: { kind: "openai", base: "https://api.openai.com/v1" },
   anthropic: { kind: "anthropic", base: "https://api.anthropic.com/v1" },
+  vertex: { kind: "openai", base: null }, // per-project: vertex.js builds it from HEIMDALL_VERTEX_PROJECT
   together: { kind: "openai", base: "https://api.together.xyz/v1" },
   cerebras: { kind: "openai", base: "https://api.cerebras.ai/v1" },
   // ---- free-tier, no-card providers (2026): OpenAI-compatible unless noted
@@ -97,6 +99,8 @@ export const PROVIDER_CATALOG = Object.freeze([
   // ---- credentialed, paid
   { provider: "openai", authClass: "api_key", location: "external", cardRequired: true, trust: "sealed-only", models: [] },
   { provider: "anthropic", authClass: "api_key", location: "external", cardRequired: true, trust: "sealed-only", models: [] },
+  // OWNER-ONLY: configured by the operator's environment (HEIMDALL_VERTEX_PROJECT), never entered from a surface (vertex.js).
+  { provider: "vertex", authClass: "api_key", location: "external", cardRequired: true, trust: "sealed-only", endpointKind: "openai", models: [...VERTEX_DEFAULT_MODELS], note: VERTEX_NOTE },
   { provider: "together", authClass: "api_key", location: "external", cardRequired: true, trust: "sealed-only", models: [], note: "not free — requires >= $5 credit as of 2025-07" },
   { provider: "cerebras", authClass: "api_key", location: "external", cardRequired: true, trust: "sealed-only", models: [] },
 ]);
@@ -135,6 +139,11 @@ export function loadProviderKeys({ env = process.env, state = {} } = {}) {
     if (typeof val === "string" && val) providers[name] = { key: val };
     else if (val && typeof val === "object" && val.key) providers[name] = { key: val.key };
   }
+  // Vertex has no stored secret: its credential is a short-lived token minted per request (vertex.js). The operator's environment (or
+  // state.providerKeys.vertex = { project }) configures it and nothing else does, so any generic key entry under that name is dropped.
+  delete providers.vertex;
+  const vx = vertexConfig({ env, state });
+  if (vx) providers.vertex = vx;
   for (const [name, models] of Object.entries(state.providerModels || {})) {
     if (providers[name] && Array.isArray(models) && models.length) providers[name].models = models.filter(Boolean);
   }

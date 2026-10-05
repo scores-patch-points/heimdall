@@ -29,7 +29,7 @@
 // alpha 0.4 — huginn's own weight). Failures drop in-flight without moving
 // the mean, so a flaky giver sheds load without poisoning its score.
 
-import { STALE_AFTER_MS } from "./liveness.js";
+import { STALE_AFTER_MS, hasAccepted, leaseLapsed } from "./liveness.js";
 import { answers } from "./models.js";
 
 export const EWMA_ALPHA = 0.4;
@@ -48,7 +48,10 @@ export function isEligible(rec, now = Date.now()) {
   if (rec.status !== "ready") return false;
   if (rec.hidden) return false; // the phone left the app: held, never routed to
   if (!rec.peer?.opened) return false;
-  if (rec.hello?.leaseUntil && now > rec.hello.leaseUntil) return false;
+  // Routable only after the horse said it accepted duty; an absent/0 lease is
+  // "not accepted yet", never "unlimited" (liveness.js lease rule).
+  if (!hasAccepted(rec)) return false;
+  if (leaseLapsed(rec, now)) return false;
   // A horse not heard from in 3 pings is stale: shown, never routed to
   // (liveness.js). Unknown lastSeen is not silence — legacy records pass.
   if (rec.lastSeen != null && now - rec.lastSeen >= STALE_AFTER_MS) return false;

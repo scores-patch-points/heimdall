@@ -10,8 +10,16 @@ const RTC_CONFIG = {
  * travels over Matrix encrypted to-device messages via the `signal`
  * callback; the actual data goes over an ordered, reliable DataChannel.
  */
+// ICE `disconnected` is often transient (wifi blip, NAT rebind): the browser
+// goes back to `connected` by itself. Wait this long for that before telling
+// the controller the link closed; `failed`/`closed` are immediate.
+export const DISCONNECT_GRACE_MS = 8000;
+
 export class RtcPeer {
-  constructor({ signal, onOpen, onClose, onMessage }) {
+  constructor({ signal, onOpen, onClose, onMessage, disconnectGraceMs = DISCONNECT_GRACE_MS }) {
+    this.disconnectGraceMs = disconnectGraceMs;
+    this._graceTimer = null;
+    this._closeSent = false;
     this.signal = signal; // (label, data) => void  -> sent over Matrix to the far end
     this.onOpen = onOpen || (() => {});
     this.onClose = onClose || (() => {});
@@ -19,7 +27,6 @@ export class RtcPeer {
     this.pc = null;
     this.dc = null;
     this.opened = false;
-    this._announced = false;
     this._create();
   }
 
@@ -30,8 +37,13 @@ export class RtcPeer {
       if (e.candidate) this.signal("ice", e.candidate);
     };
     this.pc.onconnectionstatechange = () => {
-      if (this.pc.connectionState === "connected") this._announceOpen();
-      if (["disconnected", "failed", "closed"].includes(this.pc.connectionState)) {
+      const st = this.pc.connectionState;
+      if (st === "connected") {
+        this._clearGrace(); // it came back by itself: never announced closed
+        this._announceOpen();
+      } else if (st === "disconnected") {
+        this._armGrace();
+      } else if (st === "failed" || st === "closed") {
         this._announceClose();
       }
     };
@@ -52,14 +64,31 @@ export class RtcPeer {
     };
   }
 
+  _armGrace() {
+    if (this._graceTimer != null) return;
+    this._graceTimer = setTimeout(() => {
+      this._graceTimer = null;
+      if (this.pc?.connectionState === "connected") return;
+      this._announceClose();
+    }, this.disconnectGraceMs);
+  }
+
+  _clearGrace() {
+    if (this._graceTimer != null) clearTimeout(this._graceTimer);
+    this._graceTimer = null;
+  }
+
   _announceOpen() {
-    if (this._announced) return;
-    this._announced = true;
+    if (this.opened) return;
     this.opened = true;
+    this._closeSent = false; // a later close is news again
     this.onOpen();
   }
 
   _announceClose() {
+    this._clearGrace();
+    if (this._closeSent) return; // dc.onclose + connection state both report one death
+    this._closeSent = true;
     this.opened = false;
     this.onClose();
   }
@@ -98,6 +127,7 @@ export class RtcPeer {
   }
 
   close() {
+    this._clearGrace();
     try {
       this.dc?.close();
     } catch {}

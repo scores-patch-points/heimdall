@@ -43,6 +43,11 @@ export function partsOf(message) {
       activity.push({ tool: p.tool || p.name || "tool", status: state.status || p.status || "done", title: state.title || state.input?.command || state.input?.filePath || null });
     } else if (p.type === "reasoning" && typeof p.text === "string") {
       activity.push({ tool: "reasoning", status: "done", title: null });
+    } else if (p.type === "agent" || p.type === "agentStart" || p.type === "agentEnd") {
+      // opencode's sub-agent spans: the build agent delegates to explore /
+      // general / named sub-agents. Surfaced as activity so the fold shows the
+      // agentic composition, not just the final answer.
+      activity.push({ tool: "subagent", status: "done", title: p.title || p.name || p.subagent || p.mode || null });
     }
   }
   return { text: text.trim(), activity };

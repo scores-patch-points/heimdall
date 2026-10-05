@@ -116,7 +116,8 @@ export async function ensureControllerSession({ baseUrl, creds }) {
 
 /** Record an issued/onboarded code on the account so any surface can confirm it. */
 export async function issueCode({ creds, code, exp, own = false, link = false }) {
-  const reg = await getAccountData({ ...creds, type: CODE_TYPE }).catch(() => null);
+  // A failed read THROWS: writing back from it would wipe every other active code.
+  const reg = await getAccountData({ ...creds, type: CODE_TYPE });
   const active = (reg?.active || []).filter((c) => c.exp > Date.now());
   // `own`: the host says this is one of their own devices — it borrows from
   // the fleet without first earning credit (the ledger still counts it).
@@ -138,14 +139,14 @@ export async function confirmCode({ creds, codeHash }) {
 
 /** Drop a used code from the registry so it can't be reused by another device. */
 export async function consumeCode({ creds, codeHash }) {
-  const reg = await getAccountData({ ...creds, type: CODE_TYPE }).catch(() => null);
+  const reg = await getAccountData({ ...creds, type: CODE_TYPE }); // throws on a failed read: never write back from it
   const active = (reg?.active || []).filter((c) => c.exp > Date.now() && c.hash !== codeHash);
   await setAccountData({ ...creds, type: CODE_TYPE, content: { active } }).catch(() => {});
 }
 
 /** Remember which device public key owns a userId|deviceId after pairing. */
 export async function recordPairedKey({ creds, userId, deviceId, pubKey, own = false }) {
-  const reg = await getAccountData({ ...creds, type: KEYS_TYPE }).catch(() => null);
+  const reg = await getAccountData({ ...creds, type: KEYS_TYPE }); // throws on a failed read: never overwrite the registry from it
   const paired = (reg?.paired || []).filter((k) => !(k.userId === userId && k.deviceId === deviceId));
   paired.push({ userId, deviceId, pubKey, at: Date.now(), ...(own ? { own: true } : {}) });
   await setAccountData({ ...creds, type: KEYS_TYPE, content: { paired } }).catch(() => {});
@@ -159,7 +160,7 @@ export async function ownPairedDevices({ creds }) {
 
 /** Forget a device's pairing so a re-join must prove the code again. */
 export async function forgetPairedKey({ creds, userId, deviceId = null }) {
-  const reg = await getAccountData({ ...creds, type: KEYS_TYPE }).catch(() => null);
+  const reg = await getAccountData({ ...creds, type: KEYS_TYPE }); // throws on a failed read: never overwrite the registry from it
   const paired = (reg?.paired || []).filter((k) => !(k.userId === userId && (deviceId == null || k.deviceId === deviceId)));
   await setAccountData({ ...creds, type: KEYS_TYPE, content: { paired } }).catch(() => {});
 }
@@ -170,8 +171,11 @@ export async function forgetPairedKey({ creds, userId, deviceId = null }) {
    offering a link, so a removed device stays removed no matter which
    heimdall is watching the room. deviceId null = the whole user. */
 
+/** The account's revoked list. A 404 (never written) is []; any other failure
+ *  THROWS, so callers keep their last list instead of failing open — and
+ *  revokeDevice/unrevokeDevice never write back from a failed read. */
 export async function revokedList({ creds }) {
-  const reg = await getAccountData({ ...creds, type: REVOKED_TYPE }).catch(() => null);
+  const reg = await getAccountData({ ...creds, type: REVOKED_TYPE });
   return Array.isArray(reg?.revoked) ? reg.revoked : [];
 }
 

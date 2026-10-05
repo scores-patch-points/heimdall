@@ -24,8 +24,10 @@
 // the page uses the real one). Returns executor records ready for executors.js.
 
 import { authObservation, classifyAuth } from "./auth-class.js";
+import { VERTEX_PROVIDER, VERTEX_PATH, resolveKey } from "./vertex.js";
 import { emptyExecutor } from "./executors.js";
 import { makeProviderRecord, PROVIDER_CATALOG, endpointFor } from "./providers.js";
+import { listAnthropicModels, pickModels } from "./keycheck.js";
 
 export const LOCALHOST_PROBES = Object.freeze([
   { provider: "ollama", kind: "ollama", base: "http://127.0.0.1:11434", discovery: "/api/tags" },
@@ -77,14 +79,27 @@ export async function discoverEndpoint({ base, kind, path = null, fetchImpl = fe
  *  is "no", a 200 is "yes", a 429 is unknown (rate-limited, never convicted),
  *  and a 404 is a qualified "yes" — the request reached the inference endpoint
  *  without a credential and was refused on the model, not on the key. */
-export async function probeInferenceAuth({ url, kind, key = null, model = "t", fetchImpl = fetch, timeoutMs = 20_000 } = {}) {
+export async function probeInferenceAuth({ url, kind, key = null, model = "t", fetchImpl = fetch, timeoutMs = 20_000, path = null } = {}) {
   const base = (url || "").replace(/\/+$/, "");
-  const headers = { "content-type": "application/json" };
-  if (key) headers.authorization = `Bearer ${key}`;
-  const endpoint = kind === "ollama" ? "/api/chat" : "/v1/chat/completions";
-  const body = kind === "ollama"
-    ? { model, messages: [{ role: "user", content: "hi" }], stream: false, options: { num_predict: 1 } }
-    : { model, messages: [{ role: "user", content: "hi" }], max_tokens: 1, stream: false };
+  let headers = { "content-type": "application/json" };
+  let endpoint, body;
+  if (kind === "ollama") {
+    endpoint = "/api/chat";
+    headers.authorization = `Bearer ${key}`;
+    body = { model, messages: [{ role: "user", content: "hi" }], stream: false, options: { num_predict: 1 } };
+  } else if (kind === "anthropic") {
+    // Anthropic's own wire: x-api-key (never Bearer) + anthropic-version, on
+    // /v1/messages, base being the API root (…/v1 without a double /v1).
+    endpoint = "/v1/messages";
+    const root = base.replace(/\/v1$/, "");
+    if (key) headers["x-api-key"] = key;
+    headers["anthropic-version"] = "2023-06-01";
+    body = { model, max_tokens: 1, messages: [{ role: "user", content: "hi" }] };
+  } else {
+    endpoint = path || "/v1/chat/completions";
+    headers.authorization = `Bearer ${key}`;
+    body = { model, messages: [{ role: "user", content: "hi" }], max_tokens: 1, stream: false };
+  }
   try {
     const r = await fetchImpl(base + endpoint, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
     if (r.status === 401 || r.status === 403) return { keyless: false, tested: true, status: r.status };
@@ -168,7 +183,10 @@ export async function discoverProviders(config = {}, { fetchImpl = fetch } = {})
     if (!cfg?.key) continue;
     const rec = makeProviderRecord(provider, { base: cfg.base, reachable: false });
     if (!rec) continue;
-    const named = Array.isArray(cfg.models) ? cfg.models.filter(Boolean) : [];
+    let named = Array.isArray(cfg.models) ? cfg.models.filter(Boolean) : [];
+    // Anthropic's model list needs the key and is not the OpenAI shape, so a key with no named models used to yield NO lanes at
+    // all (measured 2026-10-05: key stored, /v1/models empty). Ask Anthropic which models this key can see and use the newest few.
+    if (!named.length && rec.endpointKind === "anthropic") named = pickModels(await listAnthropicModels({ key: cfg.key, base: rec.base, fetchImpl }));
     // A named model list is a declaration, not a discovery result: it always
     // yields executors, so no `/v1/models` assay is needed (and Anthropic's
     // non-list shape can never blank the lane). Reachability is still measured:
@@ -178,10 +196,19 @@ export async function discoverProviders(config = {}, { fetchImpl = fetch } = {})
     if (named.length) {
       for (const model of named) {
         const exec = executorFor(rec, cfg, model);
-        const a = await probeInferenceAuth({ url: rec.base, kind: rec.endpointKind, key: cfg.key, model, fetchImpl });
-        exec.live.reachable = a.keyless !== false;
-        exec.live.lastVerified = a.keyless !== false ? Date.now() : null;
-        exec.live.lastError = a.keyless === false ? "inference probe refused the key (" + (a.status ?? "?") + ")" : null;
+        // Vertex: the credential is a token minted now and the path has no /v1. No Google credential is a dead lane with its reason, never a throw.
+        const isVertex = rec.provider === VERTEX_PROVIDER;
+        let probeKey = cfg.key, a = null;
+        if (isVertex) { try { probeKey = await resolveKey(VERTEX_PROVIDER, cfg.key); } catch (e) { a = { keyless: null, tested: false, status: null, note: "no Google credential: " + (e?.message || e) }; } }
+        a = a || await probeInferenceAuth({ url: rec.base, kind: rec.endpointKind, key: probeKey, model, fetchImpl, path: isVertex ? VERTEX_PATH : null });
+        // Reachable only on an answer that proves the key got through: 200/404 (keyless true) or a 429 (alive, throttled).
+        // A refused key, a billing/validation error, a 5xx, or no answer at all (offline) is NOT a working lane.
+        // A 404 elsewhere means "reached inference, refused on the model" and counts as reachable. For Vertex it means the publisher model is not
+        // served at this location (the europe-west 404s of 2026-10-05), so only a real answer (or a throttle) counts.
+        const alive = isVertex ? (a.status === 200 || a.status === 429) : (a.keyless === true || a.status === 429);
+        exec.live.reachable = alive;
+        exec.live.lastVerified = alive ? Date.now() : null;
+        exec.live.lastError = alive ? null : a.keyless === false ? "inference probe refused the key (" + (a.status ?? "?") + ")" : a.status == null ? "could not reach the provider (" + (a.note || "no answer") + ")" : "provider answered " + a.status + " to the test message";
         exec.auth.inferenceKeyless = a.keyless;
         exec.auth.tested = a.tested;
         out.push(exec);
@@ -227,6 +254,12 @@ function executorFor(rec, cfg, model, kind = rec.endpointKind, reachable = false
   exec.live.lastVerified = reachable ? Date.now() : null;
   exec.live.lastError = rec.live.lastError ?? null;
   exec.auth = authObservation({ kind: rec.authClass, developerKey: true, tested: true, inferenceKeyless: false, note: null });
+  // The provider key rides the executor (inferOn reads auth.apiKey), so a
+  // discovered frontier executor can actually speak — measured 2026-10-04:
+  // the anthropic lane reached api.anthropic.com but 401'd because the key
+  // never left the discovery config for the executor record.
+  if (cfg?.key) exec.auth.apiKey = cfg.key;
+  else if (cfg?.provider?.key) exec.auth.apiKey = cfg.provider.key;
   exec.models = [model];
   exec.advertised.structured = false;
   exec.advertised.tools = false;
@@ -300,7 +333,9 @@ export async function discoverKeylessExternal({ fetchImpl = fetch, only = null }
     const d = await discoverEndpoint({ base, kind, path, fetchImpl }).catch(() => ({ ok: false }));
     if (!d.ok) continue;
     const a = await probeInferenceAuth({ url: d.url, kind: d.kind, model: d.models[0] ?? "t", fetchImpl });
-    if (a.keyless === false) continue; // asked for a credential after all: not keyless
+    // A models LISTING proves nothing about inference. Only a one-token chat probe that got through (200, or a 404 refused on
+    // the model not the key) makes a keyless lane reachable; a 401/403 (asked for a credential), a 429/5xx or no answer does not.
+    if (a.keyless !== true) continue;
     const models = d.models.length ? d.models : (claim.models || []);
     for (const model of models) {
       const rec = emptyExecutor({

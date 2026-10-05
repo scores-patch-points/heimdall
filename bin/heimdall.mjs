@@ -152,61 +152,33 @@ if (cmd === "login") {
   console.log(`saved   ${DEFAULT_LINKS_FILE}  (${links.length} link${links.length === 1 ? "" : "s"})`);
 } else if (cmd === "key") {
   // Frontier-provider API keys live HERE, on the heimdall machine, never in a
-  // browser page. `heimdall key anthropic sk-…` writes state.providerKeys; the
-  // discovery boot (heimdall discover / the bridge) merges these with the
-  // HEIMDALL_KEY_<PROVIDER> env vars. Keys are never echoed back.
-  //
-  // `--model <id>` (repeatable) names the models a provider serves, stored in
-  // state.providerModels. A provider whose `/v1/models` is not a list
-  // (Anthropic) or that carries many models the caller wants picks them here,
-  // and discovery registers each as a frontier executor.
-  const { catalogFor, loadProviderKeys } = await import("../src/providers.js");
-  const state = load();
-  const providers = state.providerKeys || (state.providerKeys = {});
-  const modelsOf = state.providerModels || (state.providerModels = {});
-  const named = args.reduce((acc, a, i) => (a === "--model" && args[i + 1] ? [...acc, args[i + 1]] : acc), []);
-  const rm = args.includes("--rm");
-  const provider = args[1] === "--rm" ? args[2] : args[1];
-  const keyArg = args[1] === "--rm" ? args[3] : args[2];
-  if (!provider) {
-    const rows = Object.entries(loadProviderKeys({ state }));
-    console.log(rows.length ? "CONFIGURED PROVIDER KEYS (stored in " + STATE + ")" : "NO PROVIDER KEYS STORED");
-    for (const [p, v] of rows) {
-      const n = modelsOf[p]?.length ? `  · models: ${modelsOf[p].join(", ")}` : "";
-      console.log("  " + p + "  set (" + String(v.key || "").length + " chars)" + n);
-    }
-    console.log("");
-    console.log("set:   heimdall key <provider> <key> [--model <id> …]   (e.g. heimdall key anthropic sk-ant-…)");
-    console.log("remove: heimdall key --rm <provider>");
-    console.log("env:   HEIMDALL_KEY_<PROVIDER> also counts (no storage needed).");
-    process.exit(0);
-  }
-  const known = catalogFor(provider);
-  if (!known) {
-    console.error("unknown provider \"" + provider + "\" — known: openrouter groq mistral cohere google cloudflare huggingface openai anthropic together cerebras (and the local lanes)");
-    process.exit(1);
-  }
-  if (rm) {
-    delete providers[provider];
-    delete modelsOf[provider];
-    save(state);
-    console.log(`removed provider key for ${provider}`);
-    process.exit(0);
-  }
-  if (keyArg) {
-    providers[provider] = keyArg;
-    if (named.length) modelsOf[provider] = [...new Set(named)];
-    save(state);
-    console.log(`stored provider key for ${provider} (${keyArg.length} chars) in ${STATE}`);
-    if (named.length) console.log(`named models for ${provider}: ${modelsOf[provider].join(", ")}`);
-    console.log("the bridge and discovery read it from here; nothing about it reaches a browser.");
-    process.exit(0);
-  }
-  const set = loadProviderKeys({ state })[provider];
-  if (set) {
-    const n = modelsOf[provider]?.length ? `  · models: ${modelsOf[provider].join(", ")}` : "";
-    console.log(`${provider}: set (${String(set.key).length} chars) — ${known.base || "custom base"} — ${known.trust}${n}`);
-  } else console.log(`${provider}: not set`);
+  // browser page. The command tests the key live, stores it unless the provider
+  // rejects it, tells a running bridge to reload, and says in plain words what
+  // it unlocks and what to do next (src/key-cli.js). The key is never echoed.
+  //   `--model <id>` (repeatable) names the models a provider serves; with none
+  //   named, Anthropic's models are taken from the live check.
+  const { keyCommand } = await import("../src/key-cli.js");
+  const r = await keyCommand({ args, state: load(), save, stateLabel: STATE, port: Number(flag("--port", process.env.HEIMDALL_PORT || 8790)) });
+  for (const l of r.lines) console.log(l);
+  process.exit(r.code);
+} else if (cmd === "route-stats") {
+  // Measured accept rate per route × taskClass (the divisor in the router's score). Reads the running bridge when it
+  // answers (--port, default 8790), else the persisted table in ~/.heimdall/route-stats.json. --json for machines.
+  const { createRouteStats, formatStats, DEFAULT_STATS_FILE } = await import("../src/route-stats.js");
+  const port = Number(flag("--port", process.env.HEIMDALL_PORT || 8790));
+  let snap = null, source = null;
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/api/route-stats`, { signal: AbortSignal.timeout(1500) });
+    if (r.ok) { snap = await r.json(); source = `bridge :${port}`; }
+  } catch {}
+  if (!snap) { snap = createRouteStats({ file: DEFAULT_STATS_FILE }).snapshot(); source = DEFAULT_STATS_FILE; }
+  if (has("--json")) console.log(JSON.stringify(snap, null, 2));
+  else { console.log(formatStats(snap)); console.log(`(source: ${source})`); }
+} else if (cmd === "route-sim") {
+  // The routing simulator: prove local-wins / remote-wins / accept-rate flip / deadline / privacy filter on fake routes.
+  const { spawnSync: sp } = await import("node:child_process");
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  process.exit(sp(process.execPath, [join(root, "scripts", "route-sim.mjs"), ...args.slice(1)], { stdio: "inherit" }).status ?? 0);
 } else if (cmd === "reset") {
   save({});
   console.log("stored session cleared");
@@ -221,8 +193,10 @@ if (cmd === "login") {
   console.log("  heimdall discover  probe localhost + configured providers, report auth observations");
   console.log("  heimdall key       store/remove frontier provider API keys for THIS machine (server-side, never in a browser)");
   console.log("                     heimdall key <provider> <key> [--model <id> …]  ·  heimdall key --rm <provider>  ·  heimdall key (list)");
-  console.log("                     --model names the models a provider serves (repeatable); required for providers");
-  console.log("                     whose /v1/models is not a list (anthropic), and how to register several models at once");
+  console.log("                     the key is tested live, stored unless the provider rejects it, and you are told what it unlocks");
+  console.log("                     heimdall key <provider>  tests the saved key again · --model names the models to offer (repeatable)");
+  console.log("  heimdall route-stats  measured accept rate per route x taskClass [--port 8790] [--json]  (the router's divisor; see docs/ESCALATION.md)");
+  console.log("  heimdall route-sim    the routing simulator: local wins idle, remote wins saturated, accept-rate flip, deadline, privacy filter");
   console.log("  heimdall invite  [--name \"Your Name\"] [--room !id:hs] [--new] [--hs URL]");
   console.log("                   [--user @me:hs --password …]");
   console.log("  heimdall link    <host:port> [--tag gemma2:2b] [--model ID] [--key TOKEN] [--name phone]");
@@ -288,7 +262,15 @@ async function up() {
   }
   const port = Number(flag("--port", process.env.HEIMDALL_PORT || 8790));
   acquireLock(port);
-  const upstream = (process.env.OLLAMA_HOST ? (process.env.OLLAMA_HOST.startsWith("http") ? process.env.OLLAMA_HOST : "http://" + process.env.OLLAMA_HOST) : "http://127.0.0.1:11434").replace(/\/+$/, "");
+  // THE FLOOR. :11434 is usually khora's channel proxy (x-heimdall-channel: it queues one request at a time and can refuse), and the
+  // real Ollama sits on :11435. Probe both, normalise any OLLAMA_HOST spelling, and give the bridge the ordered list; warn loudly when
+  // the channel is the only floor. (The module that decides all this is src/floor.js; nothing in bridge-server.mjs prints or exits.)
+  const { normalizeOllamaHost, probeFloor } = await import("../src/floor.js");
+  const primary = normalizeOllamaHost(process.env.OLLAMA_HOST) || "http://127.0.0.1:11434";
+  const floor = await probeFloor({ primary, direct: "http://127.0.0.1:11435" });
+  const upstreams = floor.upstreams.length ? floor.upstreams : [primary];
+  const upstream = upstreams[0];
+  for (const w of floor.warnings) console.error("  WARNING  " + w);
   const passthrough = !has("--no-passthrough");
   // Headless/server start: skip both the startup open below AND the
   // bridge's own later auto-reopen when the tab drops.
@@ -343,9 +325,12 @@ async function up() {
     port,
     dist,
     upstream,
+    upstreams,
     passthrough,
     lendModel,
     autoOpen: !noOpen,
+    tokenFile: join(STATE_DIR, "bridge.token"), // per-boot access token (0600): bridge-only routes need it; `heimdall key` reads it
+    keylessExternal: has("--keyless") || !has("--no-keyless"),
     site: process.env.HEIMDALL_SITE || SITE,
     frontierExecutors,
     opencodeUrl,
@@ -364,7 +349,7 @@ async function up() {
   const url = `http://localhost:${port}/`;
   console.log("");
   console.log("  heimdall is up        " + url);
-  console.log("  Ollama upstream       " + upstream + (installed.length ? `  (${installed.length} models)` : "  (not answering — pass-through will fail)"));
+  console.log("  floor (upstream)      " + upstreams.join("  ->  ") + (floor.primaryIsChannel ? "   [first is khora's channel]" : "") + (installed.length ? `  (${installed.length} models)` : "  (not answering — pass-through will fail)"));
   console.log("  lending to phones     " + (lendModel || "nothing (no Ollama model)"));
   console.log("");
   console.log("  1. the page opens — it makes the fleet and shows a QR code");
