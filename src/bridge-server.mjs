@@ -116,6 +116,10 @@ export function createBridge({
   frontierFetch = fetch,
   opencodeUrl = process.env.HEIMDALL_OPENCODE || process.env.OPENCODE_URL || null, // a running `opencode serve` — the machine door for coding
   opencodeFetch = defaultOpencodeFetch,
+  // The generation door — penelope's weave over HTTP (the mouth server hosts
+  // /api/weave). The fold surfaces' generate lane rides this route; penelope
+  // owns generation, the bridge only routes (the /api/read pattern).
+  weaveUrl = process.env.PENELOPE_WEAVE_URL || "http://127.0.0.1:11439/api/weave",
   log = () => {},
 } = {}) {
   const tabs = new Set(); // open SSE responses; the newest one is the controller
@@ -947,6 +951,34 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
             return json(res, 200, { sessionId: out.sessionId, text: out.text, activity: out.activity, ms: out.ms, iterated: !!out.iterated, lane: "opencode" });
           } catch (e) {
             return json(res, 502, { error: "opencode did not answer: " + String(e?.message || e) });
+          }
+        }
+        case "POST /api/weave": {
+          // THE GENERATION LANE (2026-10-04): the fold surfaces' "write /
+          // compose / draft …" turns enter HERE and ride penelope's weave —
+          // the generation system's void detection (units read from the ask,
+          // a void read with a hunt) and writing across prompts (one unit per
+          // draw, field → hunt → mouth, test decides, EOT). Penelope owns
+          // generation; the bridge only routes (the /api/read pattern). Named
+          // /api/weave, NOT /api/generate — the bridge's /api/generate is the
+          // Ollama-compatible generate door (model+prompt), and a generation
+          // request is not an ollama draw. A weave hunts and draws many times,
+          // so the socket waits on penelope's own pace, never a short read
+          // timeout.
+          const b = JSON.parse((await readBody(req)).toString() || "{}");
+          if (!b || typeof b.intent !== "string" || !b.intent.trim()) return json(res, 400, { error: "body needs { intent }" });
+          try {
+            const r = await fetch(weaveUrl, {
+              method: "POST",
+              headers: { "content-type": "application/json", "x-er7-user": "penelope", "x-er7-caller": "fold-bridge" },
+              body: JSON.stringify({ intent: b.intent, artifact: b.artifact ?? "text", constraints: b.constraints, context: b.context, verification: b.verification, model: b.model ?? null, noModel: b.noModel === true }),
+              signal: AbortSignal.timeout(1500000),
+            });
+            const j = await r.json().catch(() => ({ ok: false, status: "error", error: "penelope weave returned no json" }));
+            log(`weave  penelope  intent="${String(b.intent).slice(0, 60)}"  ${j.status ?? r.status}  ${(j.evidence?.units || []).length} unit(s)`);
+            return json(res, r.ok ? 200 : (j.status === "void" ? 200 : 422), j);
+          } catch (e) {
+            return json(res, 502, { error: "penelope weave did not answer: " + String(e?.message || e) });
           }
         }
         case "POST /api/read": {
