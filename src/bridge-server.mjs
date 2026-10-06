@@ -39,6 +39,7 @@ import path from "node:path";
 import { randomUUID, randomBytes, timingSafeEqual } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createLedger, parseWorlds } from "./audit.js";
+import { isHostedOpen, HOSTED_OPEN } from "./hosted.js";
 import { createCompetence, plan as planDispatch, messagesTokens, priceOf, bucketOf, bucketLabel } from "./competence.js";
 import { exec } from "node:child_process";
 import { answers, normalizeTag, ollamaTagOf } from "./models.js";
@@ -73,7 +74,7 @@ const FORWARD_HEADERS = /^(retry-after|x-queue-position|x-heimdall-.*)$/i; // th
 const MAX_FAILED_ENTRIES = 200; // failed-rung ledger entries kept; the whole dispatch ledger is capped at 2000
 
 /** The route table, as `METHOD /path` (kept beside the switch in route_; a test fails if a route here is answered 404). Other /api/ and /v1/ paths are piped to the floor; other GETs serve the page. */
-const ROUTES = Object.freeze(["POST /api/dispatch/plan", "POST /api/dispatch/observe", "GET /api/dispatch/competence", "GET /api/audit", "GET /bridge/hello", "GET /bridge/events", "POST /bridge/state", "POST /bridge/reply", "GET /bridge/upstream/tags", "POST /bridge/upstream/chat", "GET /status", "GET /link", "GET /link/", "GET /link/hosts", "POST /link/probe", "POST /link/host", "POST /link/remove", "GET /api/version", "GET /api/ps", "GET /api/tags", "POST /api/chat", "POST /api/generate", "POST /v1/chat/completions", "POST /v1/messages", "GET /v1/models", "POST /api/job", "GET /api/route-stats", "GET /api/ledger", "GET /api/meter", "GET /api/frontier", "GET /api/providers/keys", "POST /api/providers/refresh", "POST /api/providers/check", "POST /api/providers/keys", "GET /api/code/status", "POST /api/code", "POST /api/weave", "GET /api/search", "GET /api/page", "POST /api/read", "POST /api/reason", "POST /api/agent"]);
+const ROUTES = Object.freeze(["POST /api/dispatch/plan", "POST /api/dispatch/observe", "GET /api/dispatch/competence", "GET /api/audit", "GET /bridge/hello", "GET /bridge/events", "POST /bridge/state", "POST /bridge/reply", "GET /bridge/upstream/tags", "POST /bridge/upstream/chat", "GET /status", "GET /link", "GET /link/", "GET /link/hosts", "POST /link/probe", "POST /link/host", "POST /link/remove", "GET /api/version", "GET /api/ps", "GET /api/tags", "POST /api/chat", "POST /api/generate", "POST /v1/chat/completions", "POST /v1/messages", "POST /api/race", "GET /v1/models", "POST /api/job", "GET /api/route-stats", "GET /api/ledger", "GET /api/meter", "GET /api/frontier", "GET /api/providers/keys", "POST /api/providers/refresh", "POST /api/providers/check", "POST /api/providers/keys", "GET /api/code/status", "POST /api/code", "POST /api/weave", "GET /api/search", "GET /api/page", "POST /api/read", "POST /api/reason", "POST /api/agent"]);
 
 class HttpError extends Error { constructor(status, message) { super(message); this.status = status; } }
 const escapeHtml = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -129,6 +130,7 @@ export function createBridge({
   // The floor, in order (rung 4). Default: just `upstream`. `heimdall up` adds the direct Ollama (:11435) beside khora's channel (:11434)
   // after probing both (floor.js). A step-down to the next happens only BEFORE any byte reaches the caller.
   upstreams = null,
+  laneSlots = {}, // provider -> requests we send at once (default: HOSTED_OPEN slots for the small hosted providers; others unbounded)
   upstreamFirstByteMs = 30_000, // an upstream that has not answered by now (streaming requests) is skipped
   upstreamTimeoutMs = 120_000, // total bound on one upstream call
   prefix = "", // mount point when the bridge's handler sits inside another server ("/heimdall"); "" = it owns the whole origin
@@ -250,7 +252,10 @@ export function createBridge({
       if (name.includes(":") && frontierMap.get(ex.model) === ex) continue;   // list each executor once, under its bare name
       if (seen.has(name)) continue; seen.add(name);
       const credentialed = ex.authClass === "api_key" || !!ex.auth?.apiKey;
-      out.push({ model: name, tier: credentialed ? "frontier" : "remote", ...priceOf(name, credentialed ? "frontier" : "remote"), ctxWindow: ex.contextWindow || 128000, healthy: !throttled(ex.model) && !isDown(ex) });
+      // small hosted open models are cheap and counted as open-remote, not frontier
+      const hosted = credentialed && isHostedOpen(ex.provider);
+      const tier = hosted ? "hosted" : credentialed ? "frontier" : "remote";
+      out.push({ model: name, tier, ...(hosted ? { usdInPerM: HOSTED_OPEN[ex.provider].usdInPerM, usdOutPerM: HOSTED_OPEN[ex.provider].usdOutPerM } : priceOf(name, tier)), ctxWindow: ex.contextWindow || 128000, healthy: !throttled(ex.model) && !isDown(ex) });
     }
     return out;
   };
@@ -285,7 +290,16 @@ export function createBridge({
   // key + one failed probe = configured:false): the map is swapped only when the new
   // discovery found something; otherwise the previous executors stay, marked stale.
   // A provider whose key was REMOVED is the exception: it is dropped, stale or not.
-  async function refreshFrontier() {
+  // Refreshes run ONE AT A TIME, each reading the keys as they are when it starts: three keys saved in quick succession
+  // used to race, and an older discovery that finished last swapped in a map without the newest provider (measured in the
+  // Fold's Settings 2026-10-06: DeepInfra loaded, then vanished).
+  let refreshChain = Promise.resolve();
+  function refreshFrontier() {
+    const run = refreshChain.then(refreshFrontierNow, refreshFrontierNow);
+    refreshChain = run.catch(() => {});
+    return run;
+  }
+  async function refreshFrontierNow() {
     try {
       const { discoverAll } = await import("./discovery.js");
       const { loadProviderKeys } = await import("./providers.js");
@@ -322,7 +336,12 @@ export function createBridge({
   const providerModelsLoaded = (p) => [...new Set([...frontierMap.values()].filter((ex) => ex.provider === p).map((ex) => ex.model))];
   // A key was just added (or re-tested): test it live, store it unless the provider rejected it, reload the lanes, and answer
   // in plain words. The key itself is never in the response, the log, or the ledger — only its masked tail.
-  async function keyAdded(res, provider, key, { named = [], retest = false } = {}) {
+  // Key changes run ONE AT A TIME. Each reads the state file, waits on a live check, then writes it back, so two saved at
+  // once used to lose a key (the last writer overwrote the others: three Saves in a row left one key stored).
+  let keyChain = Promise.resolve();
+  const exclusive = (fn) => { const run = keyChain.then(fn, fn); keyChain = run.catch(() => {}); return run; };
+  const keyAdded = (res, provider, key, opts) => exclusive(() => keyAddedNow(res, provider, key, opts));
+  async function keyAddedNow(res, provider, key, { named = [], retest = false } = {}) {
     const { addProviderKey, keyReport, maskKey } = await import("./keycheck.js");
     const st = readState(stateFile);
     const out = await addProviderKey(st, provider, key, { named, fetchImpl: frontierFetch });
@@ -617,6 +636,7 @@ export function createBridge({
     rungs.push({ lane: "fleet", run: () => runOnFleet({ model, ...opts }, onToken) });
     let fell = false;
     for (const rung of rungs) {
+      if (opts?.signal?.aborted) throw Object.assign(new Error("cancelled by the caller"), { aborted: true, beforeFirstToken: false });
       // a benched executor is not asked at all (circuit breaker): that is a step down too
       if (rung.ex && isDown(rung.ex)) { fell = true; log(`${rung.lane}  ${model}  benched until ${new Date(healthOf(rung.ex).downUntil).toISOString().slice(11, 19)} — stepping down`); continue; }
       const t0 = Date.now();
@@ -633,9 +653,13 @@ export function createBridge({
             rung.lane,
           );
           log(`fell through  ${model}: a higher rung broke — ${rung.lane} served`);
+        } else if (rung.lane !== "frontier") {
+          // a native app or fleet worker served it: free and local, but on the record so the token meter can say what it saved
+          recordDispatch({ id: "bridge-" + randomUUID(), taskClass: `bridge.${rung.lane}` }, model, rung.lane, { ms: out.ms, inputTokens: promptTokensOf(out), outputTokens: outputTokensOf(out), exact: Number.isFinite(out?.usage?.output) }, "deterministic/local");
         }
         return { ...out, lane: rung.lane };
       } catch (e) {
+        if (opts?.signal?.aborted || e?.aborted) throw Object.assign(e, { aborted: true, beforeFirstToken: false });   // cancelled: no step-down, no health penalty
         if (rung.ex) noteFail(rung.ex, e);
         if (!e?.beforeFirstToken) throw e;
         fell = true;
@@ -672,18 +696,45 @@ export function createBridge({
    *  remote.js inferOn). The caller has already passed the privacy gate; the
    *  body sent upstream is exactly what the Fold put there (the projection for
    *  its selected privacy mode). Every call lands a dispatch-ledger entry. */
-  async function runOnFrontier(model, { messages, temperature = 0.7, max_tokens = 1024 }, onToken) {
+  // the price of one served model, for the token ledger: a hosted provider's own estimate, else the default table
+  const priceFor = (model, lane) => {
+    const i = String(model).indexOf(":");
+    const prov = i > 0 ? String(model).slice(0, i) : null;
+    if (prov && isHostedOpen(prov)) return HOSTED_OPEN[prov];
+    return priceOf(String(model).replace(/^[a-z]+:/i, ""), lane === "frontier" ? "frontier" : "remote");
+  };
+  // requests in flight per lane, and how many a lane may take at once (null = unbounded). The race reads these so it does not pile
+  // more work on a lane that is already full; /api/frontier reports them.
+  const laneInflight = new Map();
+  const slotsFor = (ex) => laneSlots[ex.provider] ?? (isHostedOpen(ex.provider) ? HOSTED_OPEN[ex.provider].slots : null);
+  const saturated = (ex) => { const n = slotsFor(ex); return n != null && (laneInflight.get(ex) || 0) >= n; };
+  async function runOnFrontier(model, opts, onToken) {
+    const ex = frontierMap.get(model);
+    laneInflight.set(ex, (laneInflight.get(ex) || 0) + 1);
+    try { return await runOnFrontierNow(model, opts, onToken); }
+    finally { laneInflight.set(ex, Math.max(0, (laneInflight.get(ex) || 1) - 1)); }
+  }
+  async function runOnFrontierNow(model, { messages, temperature = 0.7, max_tokens = 1024, signal = null }, onToken) {
     const ex = frontierMap.get(model);
     const box = {};
-    // first-byte bound inside the total timeout: a provider that accepts and never speaks steps the ladder down at 15 s, not 120
-    const out = await inferOn(ex, { messages, temperature, maxTokens: max_tokens, onToken, fetchImpl: auditedFetchFor(ex, box), firstByteMs: frontierFirstByteMs, timeoutMs: frontierTimeoutMs });
+    const lane = isHostedOpen(ex.provider) ? "open remote" : "frontier";
+    const t0 = Date.now();
+    let out;
+    try {
+      // first-byte bound inside the total timeout: a provider that accepts and never speaks steps the ladder down at 15 s, not 120
+      out = await inferOn(ex, { messages, temperature, maxTokens: max_tokens, onToken, fetchImpl: auditedFetchFor(ex, box), firstByteMs: frontierFirstByteMs, timeoutMs: frontierTimeoutMs, signal });
+    } catch (e) {
+      // stopped by the caller (a race won elsewhere, a closed tab): on the record as cancelled, never as this lane's failure
+      if (e?.aborted) recordDispatch({ id: "bridge-" + randomUUID(), taskClass: "bridge.frontier", privacy: "sealed-external" }, `${ex.provider}:${ex.model}`, "cancelled", { ms: Date.now() - t0, inputTokens: 0, outputTokens: 0, accepted: false }, lane);
+      throw e;
+    }
     if (box.handle && out.usage) box.handle.annotate({ usage: out.usage });
     recordDispatch(
       { id: "bridge-" + randomUUID(), taskClass: "bridge.frontier", privacy: "sealed-external" },
       `${ex.provider}:${ex.model}`,
       "frontier",
-      { ms: out.ms, inputTokens: promptTokensOf(out), outputTokens: outputTokensOf(out) },
-      "frontier",
+      { ms: out.ms, inputTokens: promptTokensOf(out), outputTokens: outputTokensOf(out), exact: Number.isFinite(out?.usage?.output) },
+      lane,
     );
     log(`frontier  ${ex.provider}:${ex.model}  ${out.tokens} tokens  ${out.ms}ms`);
     return out;
@@ -1193,6 +1244,69 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
 
   /* ------------------------------------------------ OpenAI: chat/completions */
 
+  /** POST /api/race — one request to several small hosted models AT ONCE (the cheap remote tier).
+   *  body { messages, models?: ["provider:model", …], n?: 1..6 (default 3), mode?: "first" | "all", max_tokens?, temperature?, heimdall_privacy }.
+   *  No `models` = the loaded hosted open models, one per provider first so the lanes differ. The same sealed gate as chat:
+   *  the Fold seals first and says so. "first" answers with the first success (the slower calls still finish and are
+   *  ledgered — their cost is real); "all" waits for every call, so the caller can compare or witness. Benched lanes are
+   *  skipped, and every outcome feeds the circuit breaker exactly as the ladder's does. */
+  async function raceChat(req, res) {
+    const b = await readJson(req);
+    const privacy = b.heimdall_privacy || b.privacy || null;
+    if (!frontierGate(privacy)) { stats.frontierRefused++; return json(res, 400, { error: `race lanes are sealed-only — send heimdall_privacy:"sealed-external" (or "explicit"); the Fold selects its privacy mode and seals first` }); }
+    if (!Array.isArray(b.messages) || !b.messages.length) return json(res, 400, { error: "body needs { messages: [...] }" });
+    const messages = b.messages.map((m) => ({ role: m.role, content: typeof m.content === "string" ? m.content : (m.content || []).map((p) => p.text || "").join("") }));
+    const mode = b.mode === "all" ? "all" : "first";
+    const n = Math.min(6, Math.max(1, Math.floor(Number(b.n) || 3)));
+    let lanes;
+    if (Array.isArray(b.models) && b.models.length) {
+      const unknown = b.models.filter((m) => !frontierMap.has(m));
+      if (unknown.length) return json(res, 400, { error: `not loaded on this bridge: ${unknown.join(", ")} (see /api/frontier)` });
+      lanes = [...new Set(b.models.map((m) => frontierMap.get(m)))].slice(0, 6);
+    } else {
+      const hostedOnes = [...new Set(frontierMap.values())].filter((ex) => isHostedOpen(ex.provider));
+      const firstOfEach = [], rest = [], seenProv = new Set();
+      for (const ex of hostedOnes) (seenProv.has(ex.provider) ? rest : firstOfEach).push(ex), seenProv.add(ex.provider);
+      lanes = [...firstOfEach, ...rest];
+      // a lane that is already full is left out; if every lane is full, the least loaded one still takes the call
+      const open = lanes.filter((ex) => !isDown(ex) && !saturated(ex));
+      const live = lanes.filter((ex) => !isDown(ex));
+      lanes = (open.length ? open : live.sort((a, c) => (laneInflight.get(a) || 0) - (laneInflight.get(c) || 0)).slice(0, 1)).slice(0, n);
+    }
+    lanes = lanes.filter((ex) => !isDown(ex));
+    if (!lanes.length) return json(res, 404, { error: "no hosted model is loaded (or all are benched) — add a key for OpenRouter, Together, Fireworks or DeepInfra" });
+    const opts = { messages, temperature: b.temperature ?? 0.7, max_tokens: b.max_tokens ?? b.max_completion_tokens ?? 512 };
+    const t0 = Date.now();
+    const controllers = lanes.map(() => new AbortController());
+    const calls = lanes.map(async (ex, idx) => {
+      const id = `${ex.provider}:${ex.model}`;
+      try {
+        const out = await runOnFrontier(id, { ...opts, signal: controllers[idx].signal }, null);
+        noteOk(ex);
+        return { ok: true, model: id, provider: ex.provider, text: out.text, ms: out.ms ?? Date.now() - t0, tokens: outputTokensOf(out) };
+      } catch (e) {
+        if (!e?.aborted) noteFail(ex, e);
+        return { ok: false, cancelled: !!e?.aborted, model: id, provider: ex.provider, error: String(e?.message ?? e).slice(0, 200), status: e?.status ?? null, ms: Date.now() - t0 };
+      }
+    });
+    stats.race = (stats.race || 0) + 1;
+    if (mode === "all") {
+      const results = await Promise.all(calls);
+      const winner = results.filter((r) => r.ok && r.text).sort((a, c) => a.ms - c.ms)[0] || null;
+      return json(res, 200, { mode, winner, results, asked: results.length });
+    }
+    const settled = [];
+    const winner = await new Promise((resolve) => {
+      let left = calls.length;
+      calls.forEach((c, idx) => c.then((r) => {
+        settled.push(r);
+        if (r.ok && r.text) { controllers.forEach((ac, k) => { if (k !== idx) ac.abort(); }); resolve(r); }   // the others stop NOW: their tokens are never spent
+        else if (--left === 0) resolve(null);
+      }));
+    });
+    return json(res, winner ? 200 : 502, { mode, winner, results: settled.slice(), asked: calls.length, pending: Math.max(0, calls.length - settled.length) });
+  }
+
   async function openaiChat(req, res, raw) {
     let b;
     try { b = JSON.parse(raw.toString() || "{}"); } catch { return json(res, 400, { error: { message: "invalid JSON" } }); }
@@ -1217,7 +1331,7 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
     try {
       const out = await runOnGiver(
         b.model,
-        { messages, temperature: b.temperature ?? 0.7, max_tokens: b.max_tokens ?? b.max_completion_tokens ?? 1024 },
+        { messages, temperature: b.temperature ?? 0.7, max_tokens: b.max_tokens ?? b.max_completion_tokens ?? 1024, signal: goneOr(res, 600_000) },
         (delta) => { start(); if (b.stream) res.write(`data: ${JSON.stringify(chunk({ content: delta }))}\n\n`); },
       );
       stats[out.lane] = (stats[out.lane] || 0) + 1;
@@ -1520,6 +1634,8 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
           return anthropicChat(req, res, await readBody(req));
         case "GET /v1/models":
           return json(res, 200, { object: "list", data: fleetModels().map((m) => ({ id: m.name, object: "model", owned_by: m.heimdall?.frontier ? "heimdall-frontier:" + m.heimdall.frontier : "heimdall-fleet" })) });
+        case "POST /api/race":
+          return raceChat(req, res);
         case "POST /api/job": {
           // THE JOB LANE (escalation design): body { job, payload:{capsule|messages}, context? } → the decision trace, route used,
           // attempts, proposal and the local acceptance verdicts. See src/job-lane.js.
@@ -1534,12 +1650,12 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
         case "GET /api/ledger":
           return json(res, 200, { entries: dispatchLedger.slice(-200) });
         case "GET /api/meter":
-          return json(res, 200, dispatchMeter(dispatchLedger, ESTIMATE_COSTS));
+          return json(res, 200, dispatchMeter(dispatchLedger, { ...ESTIMATE_COSTS, price: priceFor }));
         case "GET /api/frontier": {
           // Which frontier providers are configured on THIS machine and what
           // they expose — model names and privacy class, never keys.
           const providers = [];
-          for (const [name, ex] of frontierMap) providers.push({ model: name, provider: ex.provider, privacy: "sealed-external", reachable: !!ex.live?.reachable, stale: !!ex.live?.stale, down: isDown(ex), ...(isDown(ex) ? { downUntil: new Date(healthOf(ex).downUntil).toISOString(), lastStatus: healthOf(ex).lastStatus } : {}), endpoint: ex.endpoint });
+          for (const [name, ex] of frontierMap) providers.push({ model: name, provider: ex.provider, privacy: "sealed-external", reachable: !!ex.live?.reachable, stale: !!ex.live?.stale, down: isDown(ex), inflight: laneInflight.get(ex) || 0, slots: slotsFor(ex), ...(isDown(ex) ? { downUntil: new Date(healthOf(ex).downUntil).toISOString(), lastStatus: healthOf(ex).lastStatus } : {}), endpoint: ex.endpoint });
           return json(res, 200, { configured: frontierMap.size > 0, providers, keySource: "server-side (heimdall key / HEIMDALL_KEY_* / the surface, never an outside executor)", gate: 'requests must carry heimdall_privacy:"sealed-external" (Fold privacy mode)' });
         }
         case "GET /api/providers/keys": {
@@ -1584,14 +1700,16 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
           if (!catalogFor(provider)) return json(res, 400, { error: `unknown provider "${provider}"` });
           if (provider === "vertex") return json(res, 403, { error: "the vertex lane is configured by the operator's environment (HEIMDALL_VERTEX_PROJECT), not entered from a surface" });
           if (b.remove) {
-            const st = readState(stateFile);
-            st.providerKeys = st.providerKeys || {};
-            delete st.providerKeys[provider];
-            if (st.providerModels) delete st.providerModels[provider];
-            writeState(st, stateFile);
-            const models = await refreshFrontier();
-            log(`provider key removed for ${provider} (server-side; ${models < 0 ? "discovery failed" : models + " model(s) reachable"})`);
-            return json(res, 200, { ok: true, provider, stored: false, configured: Object.keys(st.providerKeys), frontierModels: models, keySource: "server-side (never a browser)" });
+            return exclusive(async () => {
+              const st = readState(stateFile);
+              st.providerKeys = st.providerKeys || {};
+              delete st.providerKeys[provider];
+              if (st.providerModels) delete st.providerModels[provider];
+              writeState(st, stateFile);
+              const models = await refreshFrontier();
+              log(`provider key removed for ${provider} (server-side; ${models < 0 ? "discovery failed" : models + " model(s) reachable"})`);
+              return json(res, 200, { ok: true, provider, stored: false, configured: Object.keys(st.providerKeys), frontierModels: models, keySource: "server-side (never a browser)" });
+            });
           }
           if (!(typeof b.key === "string" && b.key.trim())) return json(res, 400, { error: "body needs { provider, key } or { provider, remove: true }" });
           return keyAdded(res, provider, b.key.trim(), { named: Array.isArray(b.models) ? b.models.filter((m) => typeof m === "string" && m) : [] });

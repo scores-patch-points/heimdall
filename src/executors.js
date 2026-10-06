@@ -7,7 +7,7 @@
 // advertised capabilities, observed doorbench evidence, live load. Heimdall
 // does not keep a separate intellectual architecture for "cloud AI."
 //
-//   live:      reachable · inflight · queue · TTFT · tokens/sec
+//   live:      reachable · inflight · queue · slots (requests served at once) · TTFT · tokens/sec
 //   advertised: tools · structured · context
 //   observed:  doorbench per taskClass · mean TTFT · tokens/sec · 429s · 5xx
 //   cost:      provider · user-pays · free/local
@@ -43,7 +43,7 @@ export function emptyExecutor({ executor, endpoint, model, provider, location, a
     authClass: authClass ?? "api_key",
     privacyClass: privacyClass ?? "sealed-only",
     // live (measured, never guessed)
-    live: { reachable: false, inflight: 0, queue: 0, ttft: null, tokensPerSecond: null, lastHeard: null },
+    live: { reachable: false, inflight: 0, queue: 0, slots: 1, ttft: null, tokensPerSecond: null, lastHeard: null },
     // advertised (what the endpoint claims / was probed to support)
     advertised: advertised ?? { tools: false, structured: false, context: null },
     // observed (doorbench evidence, keyed per task class)
@@ -172,6 +172,23 @@ export function isEligible(exec, job) {
   return true;
 }
 
+/** How many requests this executor serves at the same time (>= 1; unknown = 1, the serial case). */
+export function slotsOf(exec) {
+  const n = Math.floor(Number(exec?.live?.slots));
+  return Number.isFinite(n) && n >= 1 ? n : 1;
+}
+
+/** True while a new request would start at once instead of waiting. */
+export function hasFreeSlot(exec) {
+  return (exec?.live?.queue || 0) + (exec?.live?.inflight || 0) < slotsOf(exec);
+}
+
+/** Record how many requests the backend takes at once (a measurement or the operator's setting). */
+export function markSlots(exec, n) {
+  const k = Math.floor(Number(n));
+  return { ...exec, live: { ...exec.live, slots: Number.isFinite(k) && k >= 1 ? k : 1 } };
+}
+
 /** Time-to-accepted-result for one executor on one job:
  *    T_e = Q + N + S          Q = wait behind existing work
  *                             N = startup/network/TTFT
@@ -186,8 +203,12 @@ export function expectedTime(exec, taskClass, { networkMs = null, serviceMs = nu
   const queue = (exec.live?.queue || 0) + (exec.live?.inflight || 0);
   const S = Number.isFinite(serviceMs) && serviceMs > 0 ? serviceMs : null;
   const N = Number.isFinite(networkMs) ? networkMs : (exec.observed?.meanTTFT ?? 200);
-  const base = queue * (S ?? N ?? 300) + (S ?? N ?? 300);
-  return { ms: Math.round(base / Math.max(P, 0.01)), P, queue, S, N };
+  // A backend that serves `slots` requests at once (a batching server, a hosted API) only makes a new job wait once all its
+  // slots are taken, and then by whole waves, not by every job ahead. slots = 1 is the old serial rule: queue × S.
+  const slots = slotsOf(exec);
+  const waves = Math.ceil(Math.max(0, queue - slots + 1) / slots);
+  const base = waves * (S ?? N ?? 300) + (S ?? N ?? 300);
+  return { ms: Math.round(base / Math.max(P, 0.01)), P, queue, slots, S, N };
 }
 
 /** The full registry: executor records keyed by executor id, with the pure

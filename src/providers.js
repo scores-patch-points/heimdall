@@ -41,6 +41,8 @@ const PROVIDER_ENDPOINTS = Object.freeze({
   anthropic: { kind: "anthropic", base: "https://api.anthropic.com/v1" },
   vertex: { kind: "openai", base: null }, // per-project: vertex.js builds it from HEIMDALL_VERTEX_PROJECT
   together: { kind: "openai", base: "https://api.together.xyz/v1" },
+  fireworks: { kind: "openai", base: "https://api.fireworks.ai/inference/v1" },
+  deepinfra: { kind: "openai", base: "https://api.deepinfra.com/v1/openai" },
   cerebras: { kind: "openai", base: "https://api.cerebras.ai/v1" },
   // ---- free-tier, no-card providers (2026): OpenAI-compatible unless noted
   sambanova: { kind: "openai", base: "https://api.sambanova.ai/v1" },
@@ -101,8 +103,10 @@ export const PROVIDER_CATALOG = Object.freeze([
   { provider: "anthropic", authClass: "api_key", location: "external", cardRequired: true, trust: "sealed-only", models: [] },
   // OWNER-ONLY: configured by the operator's environment (HEIMDALL_VERTEX_PROJECT), never entered from a surface (vertex.js).
   { provider: "vertex", authClass: "api_key", location: "external", cardRequired: true, trust: "sealed-only", endpointKind: "openai", models: [...VERTEX_DEFAULT_MODELS], note: VERTEX_NOTE },
-  { provider: "together", authClass: "api_key", location: "external", cardRequired: true, trust: "sealed-only", models: [], note: "not free — requires >= $5 credit as of 2025-07" },
+  { provider: "together", authClass: "api_key", location: "external", cardRequired: true, trust: "sealed-only", models: [], note: "not free — requires >= $5 credit as of 2025-07; small hosted open models" },
   { provider: "cerebras", authClass: "api_key", location: "external", cardRequired: true, trust: "sealed-only", models: [] },
+  { provider: "fireworks", authClass: "api_key", location: "external", cardRequired: true, trust: "sealed-only", models: [], note: "small hosted open models; pay per token" },
+  { provider: "deepinfra", authClass: "api_key", location: "external", cardRequired: true, trust: "sealed-only", models: [], note: "small hosted open models; pay per token" },
 ]);
 
 /** A discovered server on someone's IP is NOT a legitimate free worker. These

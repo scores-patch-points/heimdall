@@ -173,3 +173,17 @@ test("inflight is freed exactly once on completion", () => {
 test("PRIVACY_CLASS and LOCATIONS are the declared vocabularies", () => {
   assert.deepEqual([...PRIVACY_CLASS], ["local-raw", "sealed-only"]);
 });
+test("expectedTime: a backend with free slots does not make a new job wait; waits come in whole waves, not per job", async () => {
+  const { emptyExecutor, expectedTime, markSlots, markSent, hasFreeSlot, slotsOf } = await import("./executors.js");
+  const mk = (slots, inflight) => { let e = emptyExecutor({ executor: "x:m", model: "m", provider: "x" }); e = markSlots(e, slots); for (let i = 0; i < inflight; i++) e = markSent(e); return e; };
+  const t = (e) => expectedTime(e, "chat", { serviceMs: 1000 }).ms * 0.5; // ms = base / P, and an unmeasured P is 0.5
+  assert.equal(slotsOf(mk(1, 0)), 1);
+  assert.equal(t(mk(1, 0)), 1000, "serial, idle: one service time");
+  assert.equal(t(mk(1, 3)), 4000, "serial rule unchanged: 3 ahead + yours");
+  assert.equal(t(mk(8, 3)), 1000, "8 slots, 3 busy: starts at once");
+  assert.equal(t(mk(8, 8)), 2000, "8 slots, all busy: one wave of waiting");
+  assert.equal(t(mk(8, 15)), 2000, "15 in flight over 8 slots: still one wave ahead of the next free slot");
+  assert.equal(hasFreeSlot(mk(8, 7)), true);
+  assert.equal(hasFreeSlot(mk(8, 8)), false);
+  assert.equal(slotsOf({ live: { slots: 0 } }), 1, "a nonsense slot count is serial, never zero");
+});

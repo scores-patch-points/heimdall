@@ -17,6 +17,8 @@
 // keys; a real key is only ever used by the person's own `heimdall key` call).
 
 import { endpointFor, catalogFor } from "./providers.js";
+import { isHostedOpen, pickHostedModels } from "./hosted.js";
+import { joinBase } from "./url.js";
 
 const BULLET = "•";
 
@@ -38,7 +40,7 @@ export function redactKey(text, key) {
 }
 
 /** Plain provider names for the sentences. */
-const NAMES = { anthropic: "Anthropic", openai: "OpenAI", groq: "Groq", openrouter: "OpenRouter", mistral: "Mistral", google: "Google", cohere: "Cohere", together: "Together", cerebras: "Cerebras" };
+const NAMES = { anthropic: "Anthropic", openai: "OpenAI", groq: "Groq", openrouter: "OpenRouter", mistral: "Mistral", google: "Google", cohere: "Cohere", together: "Together", cerebras: "Cerebras", fireworks: "Fireworks", deepinfra: "DeepInfra" };
 export const providerName = (p) => NAMES[p] || (p ? p[0].toUpperCase() + p.slice(1) : "the provider");
 
 /** Where a person gets a fresh key, per provider. */
@@ -48,6 +50,9 @@ const KEY_PAGES = {
   groq: "console.groq.com/keys",
   openrouter: "openrouter.ai/keys",
   mistral: "console.mistral.ai/api-keys",
+  together: "api.together.ai/settings/api-keys",
+  fireworks: "app.fireworks.ai/settings/users/api-keys",
+  deepinfra: "deepinfra.com/dash/api_keys",
 };
 const BILLING_PAGES = { anthropic: "console.anthropic.com (Plans & Billing)", openai: "platform.openai.com (Billing)" };
 
@@ -158,12 +163,12 @@ export async function checkProviderKey(provider, key, { model = null, fetchImpl 
       return done(classify(r.status, j, { retryAfter: r.headers?.get?.("retry-after") }));
     }
     // OpenAI-style: GET {base}/models with a Bearer key.
-    const r = await fetchImpl(base + "/models", { headers: { authorization: `Bearer ${k}` }, signal: AbortSignal.timeout(timeoutMs) });
+    const r = await fetchImpl(joinBase(base, "/models"), { headers: { authorization: `Bearer ${k}` }, signal: AbortSignal.timeout(timeoutMs) });
     if (r.status === 0) return done(offline(new Error("no response")));
     if (r.ok) {
       const j = await readJson(r);
       const models = (Array.isArray(j?.data) ? j.data : []).map((m) => m?.id).filter(Boolean);
-      return done(verdict("works", { http: r.status, model: null, models: models.slice(0, 50), reason: `${name} accepted the key and listed ${models.length} model${models.length === 1 ? "" : "s"} for it.` }));
+      return done(verdict("works", { http: r.status, model: null, models: models.slice(0, 50), listed: models.slice(0, 2000), reason: `${name} accepted the key and listed ${models.length} model${models.length === 1 ? "" : "s"} for it.` }));
     }
     const j = await readJson(r);
     return done(classify(r.status, j, { retryAfter: r.headers?.get?.("retry-after") }));
@@ -205,7 +210,7 @@ export function unlockLines(provider, { models = [], heimdall = "ready" } = {}) 
   } else if (heimdall === "older") {
     out.push(`Your running heimdall started before this key was saved and could not reload it. Restart it with: heimdall up. The key is saved, nothing is lost${list ? `; after the restart it will offer ${list}` : ""}.`);
   } else if (list) {
-    out.push(`Unlocked: ${list}. heimdall now offers ${models.length === 1 ? "this model" : "these models"} (they show under "Frontier · sealed" in the Fold's model list).`);
+    out.push(`Unlocked: ${list}. heimdall now offers ${models.length === 1 ? "this model" : "these models"} (they show under "${isHostedOpen(provider) ? "Open remote" : "Frontier · sealed"}" in the Fold's model list).`);
     out.push(`The Fold's online help can now use ${models.length === 1 ? "it" : "them"}: when your own computer's model is slow or gets stuck on a code task, the Fold can ask ${name} for one more try.`);
   } else {
     out.push(`The key is saved, but heimdall is not offering any ${name} model yet. Name one when you add it, e.g.: heimdall key ${provider} <your key> --model <model name>.`);
@@ -254,6 +259,8 @@ export function keyReport({ provider, key, check, saved = true, retest = false, 
  *  check, never from a guess. Returns an array (possibly empty). */
 export function verifiedModelsToRegister(provider, check, existing = []) {
   if (existing?.length) return [];
+  // hosted open-model providers: register a few SMALL models the key's own list confirms, so the key unlocks lanes at once
+  if (isHostedOpen(provider)) return check?.status === "works" ? pickHostedModels(provider, check.listed || check.models || []) : [];
   if (endpointFor(provider)?.kind !== "anthropic") return [];
   if (check?.status !== "works") return [];
   return pickModels([check.model, ...(check.models || [])]);

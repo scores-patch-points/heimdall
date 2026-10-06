@@ -85,7 +85,7 @@ export function createCompetence({ decay = 0.5, now = () => Date.now() } = {}) {
  * Plan the dispatch of one job.
  *
  * @param job         { taskClass, ctxTokens, privacy: "local-only" | "sealed-external" | "any", reserveOut?: tokens the answer needs }
- * @param candidates  [{ model, tier: "local"|"fleet"|"remote"|"frontier", usdInPerM, usdOutPerM, ctxWindow, sealedOnly?, healthy? }]
+ * @param candidates  [{ model, tier: "local"|"fleet"|"remote"|"hosted"|"frontier", usdInPerM, usdOutPerM, ctxWindow, sealedOnly?, healthy? }]
  * @param comp        a competence table
  * @param opts        { minPass: the lower bound a model must clear (default 0.7), explore: 0..1 share of cheap unmeasured tries,
  *                      rng, outTokens }
@@ -95,14 +95,14 @@ export function plan(job, candidates, comp, { minPass = 0.7, explore = 0.15, rng
   const ctx = Math.max(0, job.ctxTokens || 0), cls = job.taskClass || "code.edit";
   const excluded = [], ok = [];
   for (const c of candidates || []) {
-    const remote = c.tier === "remote" || c.tier === "frontier";
+    const remote = c.tier === "remote" || c.tier === "hosted" || c.tier === "frontier";
     if (c.healthy === false) { excluded.push({ model: c.model, why: "unhealthy (throttled or down)" }); continue; }
     if (job.privacy === "local-only" && remote) { excluded.push({ model: c.model, why: "the job must stay on this machine" }); continue; }
     if (c.ctxWindow && ctx + (job.reserveOut ?? outTokens) > c.ctxWindow) { excluded.push({ model: c.model, why: `context ${ctx} + answer does not fit its ${c.ctxWindow}-token window` }); continue; }
     ok.push(c);
   }
   // ties on price go to the model that stays closest to home: local, then fleet, then remote, then frontier
-  const TIER = { local: 0, fleet: 1, remote: 2, frontier: 3 };
+  const TIER = { local: 0, fleet: 1, remote: 2, hosted: 3, frontier: 4 };
   const tierOf = (r) => TIER[r.c.tier] ?? 2;
   const usdOf = (c) => ((ctx * (c.usdInPerM ?? 0)) + (outTokens * (c.usdOutPerM ?? 0))) / 1e6;
   const rows = ok.map((c) => { const e = comp.estimate(c.model, cls, ctx); return { c, e, usd: usdOf(c) }; });
@@ -132,7 +132,7 @@ export function plan(job, candidates, comp, { minPass = 0.7, explore = 0.15, rng
 
 /** A realistic default price table (USD per million tokens). Local and keyless tiers are free; paid tiers are listed so cost is never hidden. */
 export const DEFAULT_PRICES = Object.freeze({
-  local: { usdInPerM: 0, usdOutPerM: 0 }, fleet: { usdInPerM: 0, usdOutPerM: 0 }, remote: { usdInPerM: 0, usdOutPerM: 0 },
+  local: { usdInPerM: 0, usdOutPerM: 0 }, fleet: { usdInPerM: 0, usdOutPerM: 0 }, remote: { usdInPerM: 0, usdOutPerM: 0 }, hosted: { usdInPerM: 0.1, usdOutPerM: 0.2 },
   "claude-haiku-4-5": { usdInPerM: 1, usdOutPerM: 5 }, "claude-sonnet-5": { usdInPerM: 3, usdOutPerM: 15 }, "claude-sonnet-5-5": { usdInPerM: 3, usdOutPerM: 15 }, "claude-sonnet-4-6": { usdInPerM: 3, usdOutPerM: 15 },
   "claude-opus-5": { usdInPerM: 15, usdOutPerM: 75 }, "claude-opus-5-5": { usdInPerM: 15, usdOutPerM: 75 },
 });

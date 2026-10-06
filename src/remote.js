@@ -14,6 +14,8 @@
 // Pure-ish: network crossings take an injected fetch so tests can fake a lane.
 
 import { probeInferenceAuth } from "./discovery.js";
+import { joinBase } from "./url.js";
+import { isHostedOpen } from "./hosted.js";
 import { VERTEX_PATH, resolveKey } from "./vertex.js";
 
 /** One completion on an OpenAI-compatible lane. Resolves
@@ -65,11 +67,11 @@ function boundSignal(timeoutMs, firstByteMs) {
 const NO_TEMPERATURE = new Set();
 const NO_TEMPERATURE_RE = /^claude-sonnet-5(-5)?(-|$)/;
 export const rejectsTemperature = (model) => NO_TEMPERATURE.has(model) || NO_TEMPERATURE_RE.test(String(model));
-export async function chatOpenAI({ base, model, key = null, messages = [], temperature = 0.7, maxTokens = 1024, stream = true, onToken = null, fetchImpl = fetch, timeoutMs = 120_000, firstByteMs = 0, path = "/v1/chat/completions" } = {}) {
-  const url = `${String(base).replace(/\/+$/, "")}${path}`;
+export async function chatOpenAI({ base, model, key = null, messages = [], temperature = 0.7, maxTokens = 1024, stream = true, onToken = null, fetchImpl = fetch, timeoutMs = 120_000, firstByteMs = 0, signal = null, includeUsage = false, path = "/v1/chat/completions" } = {}) {
+  const url = joinBase(base, path);
   const headers = { "content-type": "application/json" };
   if (key) headers.authorization = `Bearer ${key}`;
-  const body = { model, messages, temperature, max_tokens: maxTokens, stream };
+  const body = { model, messages, temperature, max_tokens: maxTokens, stream, ...(stream && includeUsage ? { stream_options: { include_usage: true } } : {}) };
   const t0 = Date.now();
   let ttft = null;
   let text = "";
@@ -79,7 +81,7 @@ export async function chatOpenAI({ base, model, key = null, messages = [], tempe
   let usage = null;
   const bound = boundSignal(timeoutMs, firstByteMs);
   try {
-    const r = await fetchImpl(url, { method: "POST", headers, body: JSON.stringify(body), signal: bound.signal });
+    const r = await fetchImpl(url, { method: "POST", headers, body: JSON.stringify(body), signal: signal ? AbortSignal.any([bound.signal, signal]) : bound.signal });
     status = r.status;
     if (!r.ok) throw await refused(r);
     if (!r.body) throw Object.assign(new Error(`${status}: empty body`), { status, timedOut: false, beforeFirstToken: true });
@@ -118,8 +120,10 @@ export async function chatOpenAI({ base, model, key = null, messages = [], tempe
     }
     return { text, ms: Date.now() - t0, ttft: ttft ?? Date.now() - t0, tokens, status: 200, usage };
   } catch (e) {
-    const timedOut = e?.name === "TimeoutError" || /timed out|AbortError/i.test(String(e?.message || e?.name || ""));
-    const err = Object.assign(new Error(e?.message || "remote lane error"), { status, timedOut, beforeFirstToken: tokens === 0, retryAfterMs: e?.retryAfterMs ?? null });
+    // the CALLER cancelled (a race that was won elsewhere, a closed tab): not a timeout and not the lane's fault
+    const aborted = !!signal?.aborted;
+    const timedOut = !aborted && (e?.name === "TimeoutError" || /timed out|AbortError/i.test(String(e?.message || e?.name || "")));
+    const err = Object.assign(new Error(aborted ? "cancelled by the caller" : (e?.message || "remote lane error")), { status, timedOut, aborted, beforeFirstToken: tokens === 0, retryAfterMs: e?.retryAfterMs ?? null });
     throw err;
   } finally { bound.firstByte(); }
 }
@@ -279,7 +283,7 @@ export async function chatAnthropic({ base, model, key = null, messages = [], te
 /** Dispatch one job to an executor record, on the wire its provider speaks.
  *  Returns the chat result; throws with { timedOut, status, beforeFirstToken }
  *  on failure so executors.js can learn capacity. */
-export async function inferOn(exec, { messages = [], temperature = 0.7, maxTokens = 1024, onToken = null, fetchImpl = fetch, firstByteMs = 0, timeoutMs } = {}) {
+export async function inferOn(exec, { messages = [], temperature = 0.7, maxTokens = 1024, onToken = null, fetchImpl = fetch, firstByteMs = 0, timeoutMs, signal = null } = {}) {
   const auth = exec.auth;
   const bound = { firstByteMs, ...(timeoutMs ? { timeoutMs } : {}) };
   const key = auth?.apiKey ?? auth?.bearerKey ?? exec.apiKey ?? null;
@@ -304,7 +308,8 @@ export async function inferOn(exec, { messages = [], temperature = 0.7, maxToken
         err.beforeFirstToken = true;
         throw err;
       }
-      return chatOpenAI({ base: exec.endpoint, model: exec.model, key, messages, temperature, maxTokens, onToken, fetchImpl, ...bound });
+      // hosted open-model providers are asked to report usage on the stream, so the token meter is exact, not counted by chunks
+      return chatOpenAI({ base: exec.endpoint, model: exec.model, key, messages, temperature, maxTokens, onToken, fetchImpl, signal, includeUsage: isHostedOpen(exec.provider), ...bound });
   }
 }
 

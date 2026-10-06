@@ -114,8 +114,8 @@ test("a genuinely keyless local server is local_open and reachable", async () =>
 
 test("a configured provider with a key probes models and stays api_key", async () => {
   const ff = fakeFetch({
-    "GET https://api.groq.com/openai/v1/v1/models": { status: 200, json: { data: [{ id: "gpt-oss-120b" }] } },
-    "POST https://api.groq.com/openai/v1/v1/chat/completions": { status: 200, json: { choices: [] } },
+    "GET https://api.groq.com/openai/v1/models": { status: 200, json: { data: [{ id: "gpt-oss-120b" }] } },
+    "POST https://api.groq.com/openai/v1/chat/completions": { status: 200, json: { choices: [] } },
   });
   const recs = await discoverProviders({ groq: { key: "sk-test" } }, { fetchImpl: ff });
   assert.equal(recs.length, 1);
@@ -143,7 +143,7 @@ test("named provider models register each as its own sealed frontier executor", 
 
 test("a provider that discovers but lists no models falls back to its catalog claims", async () => {
   const ff = fakeFetch({
-    "GET https://api.groq.com/openai/v1/v1/models": { status: 200, json: { data: [] } },
+    "GET https://api.groq.com/openai/v1/models": { status: 200, json: { data: [] } },
   });
   const recs = await discoverProviders({ groq: { key: "sk-test" } }, { fetchImpl: ff });
   // Groq's catalog seeds free-tier claims; an empty live list does not erase
@@ -157,7 +157,7 @@ test("a provider that discovers but lists no models falls back to its catalog cl
 test("a provider with no discovery and no seeded models is not an executor", async () => {
   // Anthropic seeds no models and its discovery shape is not a data list.
   const ff = fakeFetch({
-    "GET https://api.anthropic.com/v1/v1/models": { status: 200, json: { data: [] } },
+    "GET https://api.anthropic.com/v1/models": { status: 200, json: { data: [] } },
   });
   const recs = await discoverProviders({ anthropic: { key: "sk-ant-test" } }, { fetchImpl: ff });
   assert.equal(recs.length, 1);

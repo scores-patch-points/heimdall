@@ -28,6 +28,7 @@ import { VERTEX_PROVIDER, VERTEX_PATH, resolveKey } from "./vertex.js";
 import { emptyExecutor } from "./executors.js";
 import { makeProviderRecord, PROVIDER_CATALOG, endpointFor } from "./providers.js";
 import { listAnthropicModels, pickModels } from "./keycheck.js";
+import { joinBase } from "./url.js";
 
 export const LOCALHOST_PROBES = Object.freeze([
   { provider: "ollama", kind: "ollama", base: "http://127.0.0.1:11434", discovery: "/api/tags" },
@@ -45,7 +46,7 @@ export async function discoverEndpoint({ base, kind, path = null, fetchImpl = fe
   const discoveryPath = path ?? (kind === "ollama" ? "/api/tags" : kind === "localai" ? "/.well-known/localai.json" : "/v1/models");
   const probe = async (p) => {
     try {
-      const r = await fetchImpl(url + p, { signal: AbortSignal.timeout(timeoutMs) });
+      const r = await fetchImpl(joinBase(url, p), { signal: AbortSignal.timeout(timeoutMs) });
       if (!r.ok) return null;
       const j = await r.json();
       return j;
@@ -101,7 +102,7 @@ export async function probeInferenceAuth({ url, kind, key = null, model = "t", f
     body = { model, messages: [{ role: "user", content: "hi" }], max_tokens: 1, stream: false };
   }
   try {
-    const r = await fetchImpl(base + endpoint, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
+    const r = await fetchImpl(joinBase(base, endpoint), { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
     if (r.status === 401 || r.status === 403) return { keyless: false, tested: true, status: r.status };
     if (r.status === 200) return { keyless: true, tested: true, status: r.status };
     if (r.status === 404) return { keyless: true, tested: true, status: r.status, note: "reached inference without a key (refused on the model)" };
@@ -194,7 +195,8 @@ export async function discoverProviders(config = {}, { fetchImpl = fetch } = {})
     // observe an auth failure is offered (a 200/404/keyless is reachable; a
     // 401/403 marks the executor unreachable with the reason, never silent).
     if (named.length) {
-      for (const model of named) {
+      // the models of one provider are probed together, not one after another (a save re-probes every provider's lanes)
+      const execs = await Promise.all(named.map(async (model) => {
         const exec = executorFor(rec, cfg, model);
         // Vertex: the credential is a token minted now and the path has no /v1. No Google credential is a dead lane with its reason, never a throw.
         const isVertex = rec.provider === VERTEX_PROVIDER;
@@ -211,8 +213,9 @@ export async function discoverProviders(config = {}, { fetchImpl = fetch } = {})
         exec.live.lastError = alive ? null : a.keyless === false ? "inference probe refused the key (" + (a.status ?? "?") + ")" : a.status == null ? "could not reach the provider (" + (a.note || "no answer") + ")" : "provider answered " + a.status + " to the test message";
         exec.auth.inferenceKeyless = a.keyless;
         exec.auth.tested = a.tested;
-        out.push(exec);
-      }
+        return exec;
+      }));
+      out.push(...execs);
       continue;
     }
     const d = await discoverEndpoint({ base: cfg.base || rec.base, kind: rec.endpointKind, fetchImpl }).catch(() => ({ ok: false }));
