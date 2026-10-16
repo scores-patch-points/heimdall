@@ -51,6 +51,7 @@ import { inferOn } from "./remote.js";
 import { record as dispatchRecord, meter as dispatchMeter, ESTIMATE_COSTS } from "./dispatch.js";
 import { code as opencodeCode } from "./opencode-lane.js";
 import { createJobLane } from "./job-lane.js";
+import { BY_THE_FOLD, isByTheFold, byTheFoldJob, proposalText, messagesOf, disclosureOf, byTheFoldOpenAI, byTheFoldAnthropic, byTheFoldOllama } from "./by-the-fold.js";
 import { createRouteStats, DEFAULT_STATS_FILE } from "./route-stats.js";
 import { makeSearcher, fetchPage } from "./websearch.js";
 
@@ -442,6 +443,33 @@ export function createBridge({
       route.trust === "external" ? null : "deterministic/local",
     ),
   });
+  // HEIMDALL BY THE FOLD (src/by-the-fold.js): a selectable model id that runs the void loop.
+  // Privacy defaults LOCAL (disclosure none); the caller's sealed label lets it reach a frontier.
+  async function byTheFold(req, res, b, wire) {
+    const messages = messagesOf(b);
+    const job = byTheFoldJob({
+      messages,
+      model: b.heimdall_model ?? null,
+      privacy: b.heimdall_privacy || b.privacy || null,
+      routing: b.heimdall_routing || b.routing || null,
+      objective: b.objective || null,
+      acceptance: b.heimdall_acceptance || null,
+      maxTokens: b.max_tokens ?? b.max_completion_tokens ?? b.options?.num_predict ?? 1024,
+      task: b.task || null,
+    });
+    const out = await jobLane.handle({ job, payload: { messages }, context: b.heimdall_context || {} });
+    const t = out.body;
+    log(`fold    by-the-fold  ${t.state}  via ${t.route}  ${(t.attempts || []).length} attempt(s)`);
+    const meta = disclosureOf(t);
+    if (t.state !== "accepted") {
+      const message = `heimdall-by-the-fold produced no accepted answer: ${t.state}${t.gap ? ` (${t.gap.kind || t.gap})` : ""}`;
+      return json(res, 502, wire === "openai" ? { error: { message }, heimdall: meta } : { error: message, heimdall: meta });
+    }
+    const text = proposalText(t.proposal);
+    if (wire === "openai") return byTheFoldOpenAI(res, b, text, meta);
+    if (wire === "anthropic") return byTheFoldAnthropic(res, b, text, meta);
+    return byTheFoldOllama(res, b, text, meta);
+  }
   // THE ORIGIN WALL. A browser request carries an Origin; it is served only when it is this bridge's OWN origin (whatever port the
   // bridge — or the server it is embedded in — is on) or an entry of the EXPLICIT allowlist (allowedOrigins / HEIMDALL_ALLOWED_ORIGINS,
   // e.g. the fold's own origin). Any other page — another loopback port included — is refused. Never "*". Origin-less callers (curl, a
@@ -1188,6 +1216,7 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
   async function ollamaRun(req, res, raw, kind) {
     let b;
     try { b = JSON.parse(raw.toString() || "{}"); } catch { return json(res, 400, { error: "invalid JSON" }); }
+    if (isByTheFold(b.model)) return byTheFold(req, res, b, "ollama");
     const privacy = b.heimdall_privacy || b.privacy || null;
     defaultToWebllm(b);
     if (isFrontier(b.model) && !frontierGate(privacy)) {
@@ -1315,6 +1344,7 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
   async function openaiChat(req, res, raw) {
     let b;
     try { b = JSON.parse(raw.toString() || "{}"); } catch { return json(res, 400, { error: { message: "invalid JSON" } }); }
+    if (isByTheFold(b.model)) return byTheFold(req, res, b, "openai");
     const privacy = b.heimdall_privacy || b.privacy || null;
     defaultToWebllm(b);
     if (isFrontier(b.model) && !frontierGate(privacy)) {
@@ -1360,6 +1390,7 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
   async function anthropicChat(req, res, raw) {
     let b;
     try { b = JSON.parse(raw.toString() || "{}"); } catch { return json(res, 400, { error: { type: "invalid_request_error", message: "invalid JSON" } }); }
+    if (isByTheFold(b.model)) return byTheFold(req, res, b, "anthropic");
     const privacy = b.heimdall_privacy || b.privacy || null;
     defaultToWebllm(b);
     if (isFrontier(b.model) && !frontierGate(privacy)) {
@@ -1627,7 +1658,7 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
             try { up = (await (await fetch(upstream + "/api/tags", { signal: AbortSignal.timeout(3000) })).json()).models ?? []; } catch {}
           }
           const names = new Set(fleet.map((m) => m.name));
-          return json(res, 200, { models: [...fleet, ...up.filter((m) => !names.has(m.name))] });
+          return json(res, 200, { models: [{ name: BY_THE_FOLD, model: BY_THE_FOLD, digest: "the-fold", size: 0, heimdall: { byTheFold: true } }, ...fleet, ...up.filter((m) => !names.has(m.name))] });
         }
         case "POST /api/chat":
           return ollamaRun(req, res, await readBody(req), "chat");
@@ -1638,7 +1669,7 @@ to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:
         case "POST /v1/messages":
           return anthropicChat(req, res, await readBody(req));
         case "GET /v1/models":
-          return json(res, 200, { object: "list", data: fleetModels().map((m) => ({ id: m.name, object: "model", owned_by: m.heimdall?.frontier ? "heimdall-frontier:" + m.heimdall.frontier : "heimdall-fleet" })) });
+          return json(res, 200, { object: "list", data: [{ id: BY_THE_FOLD, object: "model", owned_by: "the-fold" }, ...fleetModels().map((m) => ({ id: m.name, object: "model", owned_by: m.heimdall?.frontier ? "heimdall-frontier:" + m.heimdall.frontier : "heimdall-fleet" }))] });
         case "POST /api/race":
           return raceChat(req, res);
         case "POST /api/job": {

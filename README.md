@@ -103,6 +103,18 @@ function, never a model), and the whole is checked **after** assembly: the parts
 may each be satisfied and the job still be refused. A cut that overlaps a
 capability or fails to cover the job is refused with a typed gap, never run.
 
+**Select it as a model: `Heimdall By The Fold`.** The bridge lists the id
+`heimdall-by-the-fold` in `/v1/models` (and `/api/tags`); any OpenAI/Ollama/
+Anthropic client that names it runs the void loop instead of a fixed model. A
+plain chat carries no ground-truth check, so it routes by **measured quality**
+(competence) behind a **structural gate** (the completion is non-empty) — honest
+competence routing, not silent cheapest; a caller wanting strict cheapest sets
+`heimdall_routing:"cheapest"` and may strengthen the gate with
+`heimdall_acceptance`. Privacy defaults **local** (disclosure none): the alias
+never reaches a frontier without the caller's `heimdall_privacy:
+"sealed-external"`. Every accepted call teaches the competence table, and the
+reply discloses `heimdall.served_by` — which model actually answered.
+
 **"No developer API key" is a first-class capability.** `src/auth-class.js`
 tells six things apart that are commonly all called "no API key":
 
