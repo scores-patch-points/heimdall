@@ -115,6 +115,13 @@ never reaches a frontier without the caller's `heimdall_privacy:
 "sealed-external"`. Every accepted call teaches the competence table, and the
 reply discloses `heimdall.served_by` — which model actually answered.
 
+**Make it selectable in opencode.** `node scripts/opencode-provider.mjs --write`
+installs an opencode provider block (`provider.heimdall`, model
+`heimdall-by-the-fold`) pointing at this bridge's `/v1`; restart opencode and
+pick "Heimdall By The Fold". (`--write` merges, keeps a `.bak`, and refuses to
+touch an existing `provider.heimdall`.) The bridge must be running (`heimdall
+up`). Not yet verified against a live opencode build on this machine.
+
 **"No developer API key" is a first-class capability.** `src/auth-class.js`
 tells six things apart that are commonly all called "no API key":
 
