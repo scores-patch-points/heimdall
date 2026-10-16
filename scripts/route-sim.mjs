@@ -27,6 +27,20 @@ console.log(`4b same deadline, but local-idle stalls (${N4} seeds): first attemp
 const priv = await simulate({ seed: 1, jobOver: { disclosure: "none", privacy: "local-raw" }, routesOver: { "local-idle": { sim: { quality: 0 } }, "local-saturated": { reachable: false } } });
 show("5 disclosure none, local always wrong", priv.trace, `remote/device called: ${priv.calls.some((c) => c.route === "remote" || c.route === "device")}  gap=${priv.trace.final.gap?.about ?? "-"}`);
 
+console.log("\n== cheapest mode: minimize expected cost per ACCEPTED answer (C/P), gated by the job's local acceptance checks");
+// local-idle is made slow (4000ms) and the remote lane is fast (raw 1150ms) but paid (usd 0.02):
+// the fastest router takes the paid lane; the cheapest takes the free one whenever its answer passes.
+show("6a fastest, local slow + remote fast/paid", (await simulate({ seed: 1, routesOver: { "local-idle": { serviceMs: 4000 } } })).trace);
+show("6b cheapest, same routes", (await simulate({ seed: 1, jobOver: { routing: "cheapest" }, routesOver: { "local-idle": { serviceMs: 4000 } } })).trace);
+// and what makes the price worth paying: a free lane costs nothing to TRY (E$ = 0/P = 0), so cheapest exhausts
+// every free lane before it pays — escalation (which excludes a failed lane) is what carries it up to the paid one.
+{
+  const escTrace = await simulate({ seed: 1, jobOver: { routing: "cheapest" }, routesOver: {
+    "local-idle": { sim: { quality: 0 } }, "local-saturated": { reachable: false }, "device": { reachable: false },
+  } });
+  console.log(`6c free lane always fails its check: first=${first(escTrace.trace)} -> final=${escTrace.trace.final.state} via=${escTrace.trace.final.route} in ${escTrace.trace.attempts.length} attempt(s)`);
+}
+
 console.log("\n== sensitivity: who is chosen first at the 0.5 prior, by local service time (remote raw = 450+700 = 1150ms)");
 console.log("local serviceMs : chosen   (raw local vs remote; at the prior both P=0.5, so the lower raw time wins)");
 for (const ms of [500, 900, 1100, 1150, 1300, 2000, 4000]) {

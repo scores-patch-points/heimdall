@@ -417,7 +417,11 @@ export function createBridge({
       const id = `${ex.provider}:${ex.model}`;
       if (seen.has(id)) continue;
       seen.add(id);
-      out.push({ id, kind: "remote", trust: "external", model: ex.model, capabilities: ["reasoning", "classification", "composition", "extraction", "verification", "compute", "retrieval", "structured-output", "native-tools", "long-context"], run: async (messages, { maxTokens }) => {
+      // The lane's price, when it is known (a hosted-provider estimate or the price table): a "cheapest" job can then
+      // weigh paying for it. A provider whose price is NOT known rides UNPRICED — costTerms never reads unknown as free.
+      const price = priceFor(ex.model, isHostedOpen(ex.provider) ? "remote" : "frontier") ?? {};
+      const priced = (price.usdInPerM > 0 || price.usdOutPerM > 0) ? { usdInPerM: price.usdInPerM, usdOutPerM: price.usdOutPerM } : {};
+      out.push({ id, kind: "remote", trust: "external", model: ex.model, capabilities: ["reasoning", "classification", "composition", "extraction", "verification", "compute", "retrieval", "structured-output", "native-tools", "long-context"], ...priced, run: async (messages, { maxTokens }) => {
         const o = await inferOn(ex, { messages, temperature: 0, maxTokens, fetchImpl: auditedFetchFor(ex) });
         return { text: o.text, ms: o.ms, tokens: o.tokens, status: o.status };
       } });
@@ -426,8 +430,9 @@ export function createBridge({
   };
   const jobLane = createJobLane({
     stats: routeStats,
+    comp, // the measured-competence table (who is good at what): the void loop learns into it and routes from it
     routes: async (form) => (jobRoutes ? jobRoutes(form) : [...(await liveJobRoutes(form)), ...(extraJobRoutes ? await extraJobRoutes(form) : [])]),
-    saveStats: () => routeStats.save(),
+    saveStats: () => { routeStats.save(); saveComp(); },
     // every attempt — chosen route, why, verdict — enters the dispatch ledger (exact external tokens stay exact)
     record: ({ job, route, attempt }) => recordDispatch(
       { id: job.id, taskClass: job.taskClass, privacy: job.privacy },

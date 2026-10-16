@@ -90,6 +90,83 @@ its only production caller is `src/code-fix.js`, which only its own test
 imports. The README's registry story describes a design and a test path,
 not the live path. The live path is the ladder above.
 
+**The cheap route (2026-10).** `POST /api/job` (`src/job-lane.js` →
+`src/escalation.js`) resolves a job to a route and judges every proposal with
+the job's own local `acceptance` checks. A job that sets `routing: "cheapest"`
+(or `objective: "batch"`) minimizes expected cost per accepted answer,
+`E[$_accepted] = C / P`, instead of time — so a free local/device route is
+tried and checked before any paid route is paid for, and a failing proposal
+escalates rather than being kept. On the final attempt (when no budget is left
+to recover) cost stops mattering and the pick maximizes the measured accept
+probability. This is live on the bridge (`POST /api/job`), tested in
+`src/escalation.test.mjs` (10 cases) and shown in `scripts/route-sim.mjs`
+scenario 6.
+
+**Falsifying the cheap route (2026-10).** `scripts/falsify-cheapest.mjs` runs
+identical jobs under `cheapest` and `fastest` with per-(job,route) deterministic
+model behaviour, so only the routing differs. Result, stated honestly:
+- it holds where the free lane is adequate (benign world: same accepted rate,
+  ~8× cheaper) and never accepts materially fewer jobs than fastest in any
+  world tried;
+- the first version **failed** the adversarial world (more bad free lanes than
+  the attempt budget → `cheapest` accepted **0%** vs `fastest` **100%**, because
+  a free lane's expected cost is `0/P = 0` for any pass rate). The last-attempt
+  reservation above is the fix; the flood world now accepts 100%;
+- a **bounded residual** remains (tight budget, everything unmeasured: ~0.6% of
+  jobs gambled on a cheap lane and lost, while still costing less) — the price
+  of exploring cheap lanes, no longer a 0%-vs-100% cliff;
+- with a **weak acceptance check** it is worse: a schema-only gate let
+  `cheapest` keep wrong answers 72% of the time vs `fastest` 9% — because a
+  cheaper model is used more often. The mode is only ever as strong as the
+  job's own `acceptance`; a job that cannot define a good answer ahead of time
+  must not use it (the reason `qualityFloor` exists and stays unread here).
+
+**The void loop + learning who is good at what (2026-10).** `src/void.js` makes
+the job lane the Fold's own void recursion: **DEF** the void from the job's
+`acceptance` closure (a job with no acceptance defines no void — a typed
+`no-closure` gap, never a fillable one); **EVA** the *satisfaction* of each
+proposal (satisfied / refuted / gap, three-valued); **REC** onto the next giver
+on a refutation, and a **wall** (disclosed) when no giver fills it. It is built
+on `escalation.runJob`, so eligibility, disclosure and deadlines are unchanged.
+Every EVA also **teaches** the competence table (`competence.js`), keyed by the
+giver's **model × taskClass × size bucket** — "who is good at what" — and the
+void's routing P is read back from that table when it has evidence, so what was
+measured is what routes next. `/api/job` runs this loop and persists the table
+(`~/.heimdall/competence.json`). Tested in `src/void.test.mjs` (7 cases), and
+falsified in `scripts/falsify-void.mjs`: **0 false satisfactions** over 300
+voids (never reports the void filled without the check holding, re-verified
+independently); learning moves selection (a fast-but-bad model's share of first
+picks 35% → 0% over 120 voids); an unsatisfiable void walls (never a silent
+fill); and a **model pin (the received floor) is honored over learning**. Honest
+limits: the competence table is only as good as the EVAs that feed it (a weak
+gate teaches the wrong lesson); a table cell needs trials before it can move a
+decision; and a refuted model is not retried on the same void, but may return on
+a later one as fresh evidence accrues.
+
+**Pulling a job apart: tool-calling vs generation, merged by the system
+(2026-10).** `src/compose.js` makes a job a set of **parts** — declared
+(`job.parts`) or inferred mechanically from `requires`/`protocols` (never
+drawn): a part needing `native-tools` becomes `mechanical.tool`, the rest stay
+the job's own class. Each part is its own void (chased with `void.js`), so the
+competence table learns **who is good at tool calling** separately from
+generation; the tool part can only reach a model that advertises tools. The part
+proposals are **merged by the system** (`assemble` — a pure function, zero model
+calls), and the **whole** is EVA'd after assembly (the cut sees the whole stack:
+completeness ↔ Gebser, exclusivity ↔ Houdini). A cut that overlaps a capability
+or fails to cover the job is refused with a typed gap (`not-exclusive` /
+`not-complete`), never run. `/api/job` runs this (a job with no `parts` and no
+tool need stays a single void). Tested in `src/compose.test.mjs` (8 cases) and
+falsified in `scripts/falsify-compose.mjs`, all PASS: the merge makes **no model
+call**; a tool part only ever reaches a tool-advertising model (and is never
+faked on a non-tool model when none exists); a composite is **never accepted
+when the whole check failed after assembly**; bad cuts are refused; and
+tool-calling competence stays distinct from generation competence. Honest
+limits: per-part learning needs a per-part `acceptance` (a part with none is
+drawn and judged only in the whole, teaching nothing); the inferred split
+carries no part checks by default, so callers wanting per-capability learning
+declare the parts; and the merge is by `id`/`text` (or `fields`), so a job that
+needs a richer join declares a merge rule.
+
 ### L4 — The executors (the acts)
 
 | Executor | Transport | Wired | Tested | Live |

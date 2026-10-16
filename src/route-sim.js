@@ -23,13 +23,15 @@ export function rng32(seed) {
 
 const BASE_CAPS = ["reasoning", "classification", "composition", "extraction", "verification", "compute", "retrieval", "structured-output"];
 
-/** The four design routes. `sim.quality` is the ASSUMED probability its proposal passes the local checks. */
+/** The four design routes. `sim.quality` is the ASSUMED probability its proposal passes the local checks.
+ *  `usd` is the ASSUMED price of one attempt: local and device stay on the machine (free), the remote lane is
+ *  paid — so a "cheapest" job trades the faster paid lane for a free one whenever the free one is accepted. */
 export function simRoutes(over = {}) {
   const routes = [
-    { id: "local-idle", kind: "local-model", trust: "local", capabilities: BASE_CAPS, queue: 0, inflight: 0, networkMs: 0, serviceMs: 900, sim: { quality: 0.9 } },
-    { id: "local-saturated", kind: "local-model", trust: "local", capabilities: BASE_CAPS, queue: 8, inflight: 2, networkMs: 0, serviceMs: 900, sim: { quality: 0.9 } },
-    { id: "device", kind: "device", trust: "private-fleet", capabilities: BASE_CAPS, queue: 1, inflight: 0, networkMs: 120, serviceMs: 3000, sim: { quality: 0.8 } },
-    { id: "remote", kind: "remote", trust: "external", exposure: "abstract-capsule-only", capabilities: [...BASE_CAPS, "native-tools", "long-context"], queue: 0, inflight: 0, networkMs: 450, serviceMs: 700, sim: { quality: 0.95 } },
+    { id: "local-idle", kind: "local-model", trust: "local", capabilities: BASE_CAPS, queue: 0, inflight: 0, networkMs: 0, serviceMs: 900, usd: 0, sim: { quality: 0.9 } },
+    { id: "local-saturated", kind: "local-model", trust: "local", capabilities: BASE_CAPS, queue: 8, inflight: 2, networkMs: 0, serviceMs: 900, usd: 0, sim: { quality: 0.9 } },
+    { id: "device", kind: "device", trust: "private-fleet", capabilities: BASE_CAPS, queue: 1, inflight: 0, networkMs: 120, serviceMs: 3000, usd: 0, sim: { quality: 0.8 } },
+    { id: "remote", kind: "remote", trust: "external", exposure: "abstract-capsule-only", capabilities: [...BASE_CAPS, "native-tools", "long-context"], queue: 0, inflight: 0, networkMs: 450, serviceMs: 700, usd: 0.02, sim: { quality: 0.95 } },
   ];
   return routes.map((r) => ({ ...r, ...(over[r.id] || {}), sim: { ...r.sim, ...(over[r.id]?.sim || {}) } }));
 }

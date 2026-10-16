@@ -10,6 +10,27 @@
     "id": { "type": "string", "minLength": 1 },
     "taskClass": { "type": "string", "pattern": "^[a-z0-9]+(\\.[a-z0-9]+)+$", "description": "Dotted class from src/job.js TASK_CLASSES; routing evidence is keyed on this." },
     "objective": { "enum": ["interactive", "batch"], "description": "interactive optimizes time-to-acceptable-answer; batch may trade time for money/energy." },
+    "routing": { "type": ["string", "null"], "enum": ["fastest", "cheapest", null], "description": "The objective the router minimizes (src/escalation.js choose). fastest = E[time-to-accepted]; cheapest = E[cost-per-accepted], gated by the job's own local acceptance checks. null derives from objective (batch -> cheapest). A cheapest pick is only ever kept when acceptance passes; a failing proposal escalates, never downgrades." },
+    "parts": {
+      "type": ["array", "null"],
+      "description": "A COMPOSITE job: sub-tasks pulled apart by capability, each routed on its own (src/compose.js) and merged by the SYSTEM, never a model. A part needing native-tools (taskClass mechanical.tool) can only reach a model that advertises tools, so tool-calling splits from generation. null = inferred mechanically from `requires`/`protocols`, or a single whole.",
+      "items": {
+        "type": "object",
+        "required": ["taskClass"],
+        "properties": {
+          "id": { "type": "string" },
+          "taskClass": { "type": "string", "pattern": "^[a-z0-9]+(\\.[a-z0-9]+)+$" },
+          "requires": { "type": "array", "items": { "type": "string" } },
+          "protocols": { "type": "array", "items": { "enum": ["native-tools", "door-grammar", "door-text"] } },
+          "acceptance": { "type": "array" },
+          "output": { "type": "object" },
+          "model": { "type": ["string", "null"] },
+          "task": { "type": ["string", "null"] }
+        },
+        "additionalProperties": false
+      }
+    },
+    "merge": { "enum": ["byPart", "text", "fields"], "description": "How a composite job's part proposals are merged — by the system: byPart = { byPart: {id: proposal}, text }; text adds the concatenation; fields additionally flattens object parts. Default byPart." },
     "privacy": { "enum": ["local-raw", "sealed-external"], "description": "local-raw = executor inside the trust domain sees raw spans; sealed-external = the provider receives only the external projection (spec §2.I)." },
     "effects": {
       "type": "array",

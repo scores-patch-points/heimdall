@@ -65,6 +65,44 @@ that succeeds 50% of the time is an 800ms solution. Congestion is learned:
 429s, 5xx, timeouts, and inflight are measured per provider, and the same
 model can be re-routed to a second provider when the first degrades.
 
+**Or cheapest, when a good answer is defined up front.** A job may set
+`routing: "cheapest"` (or `objective: "batch"`), and the router minimizes
+expected **cost** per accepted answer instead — `E[$_accepted] = C / P`, the
+same division, with price where time was. This is the one mode that needs the
+job's own `acceptance` checks: they are what certify a cheaper answer as good,
+and a proposal that fails one escalates to the next-cheapest lane rather than
+being kept. A free local or device route costs nothing to try, so cheapest
+exhausts the free lanes before it ever pays; a paid lane is only ever charged
+when the free ones are exhausted and its answer is accepted. A route whose
+price is unknown is never assumed free (`src/escalation.js::costTerms`) — it
+rides unpriced and is used only as a last resort. And on the **final** attempt
+cost stops mattering: the pick maximizes the measured chance of an accepted
+answer, so a field of cheap lanes that keep failing can never spend the whole
+budget before a lane that can actually answer is tried.
+
+**A job is a void; the loop is DEF → EVA → REC, and it learns.** Following the
+Fold's own doctrine ("defining the void, recursively"), `src/void.js` treats a
+job as something missing: **DEF** the void from the job's `acceptance` closure
+(no closure → the void is undefined, a typed gap — nothing could say it is
+filled); **EVA** each proposal's *satisfaction* (satisfied / refuted / gap —
+a gap is never a yes); **REC** onto the next giver on a refutation, and *wall*
+the void when no giver fills it (disclosed, never a silent fill). Every EVA is
+also evidence: it teaches the competence table **who is good at what** —
+`(model, taskClass, size) → accepted` — so the next void's DEF reads routing P
+from what was measured, not from a name. `/api/job` runs this loop and persists
+the table (`~/.heimdall/competence.json`).
+
+**A job can be pulled apart — tool-calling split from generation.** `src/compose.js`
+lets one job be a set of **parts** (declared, or inferred mechanically from
+`requires`/`protocols`): a part needing `native-tools` (task class
+`mechanical.tool`) can only reach a model that advertises tools, while the
+generation part stays on the models good at text. Each part is its own void, so
+the competence table learns **who is good at tool calling** separately from who
+is good at generation. The **system merges** the parts (`assemble` — a pure
+function, never a model), and the whole is checked **after** assembly: the parts
+may each be satisfied and the job still be refused. A cut that overlaps a
+capability or fails to cover the job is refused with a typed gap, never run.
+
 **"No developer API key" is a first-class capability.** `src/auth-class.js`
 tells six things apart that are commonly all called "no API key":
 

@@ -21,9 +21,11 @@
 //   · every attempt is written to the dispatch ledger (`record`) with its verdict, and to the
 //     persistent per-route × taskClass accept-rate table.
 
-import { makeJob, validateJob, disclosureOf } from "./job.js";
-import { runJob, exposureOf } from "./escalation.js";
+import { makeJob, validateJob, disclosureOf, routingOf } from "./job.js";
+import { exposureOf } from "./escalation.js";
+import { compose } from "./compose.js";
 import { runAcceptance, registerCheck } from "./acceptance.js";
+import { messagesTokens } from "./competence.js";
 import { validateCapsule, renderPrompt, proposalFromReply, registerCapsuleChecks } from "./capsule.js";
 import { parseAnswer } from "./capsule.js";
 
@@ -38,7 +40,7 @@ const DEFAULTS = Object.freeze({ // labelled ASSUMPTIONS until the lane has meas
  * deps.routes(payloadKind) → [{ id, kind, trust, model?, capabilities?, queue?, inflight?, run(messages, { maxTokens, signal }) → { text, ms?, tokens? } }]
  * deps.stats      a route-stats object      deps.record(entry)   the dispatch-ledger hook
  */
-export function createJobLane({ stats, routes, record = () => {}, saveStats = () => {}, explore = "greedy", exposurePenaltyMs = 0 }) {
+export function createJobLane({ stats, routes, record = () => {}, saveStats = () => {}, explore = "greedy", exposurePenaltyMs = 0, comp = null }) {
   registerCapsuleChecks();
   const observedMs = new Map(); // route id → EWMA service ms (measured)
   const ewma = (id, ms) => observedMs.set(id, observedMs.has(id) ? Math.round(0.6 * observedMs.get(id) + 0.4 * ms) : Math.round(ms));
@@ -70,6 +72,7 @@ export function createJobLane({ stats, routes, record = () => {}, saveStats = ()
 
     // ── routes: outside-the-machine routes expose the payload's FORM; local routes expose nothing
     const exposure = form === "capsule" ? "abstract-capsule-only" : "sealed-external-text";
+    const inputTokens = messagesTokens(messages); // for a per-million-priced route's cost (costTerms); local routes are free regardless
     const rs = (await routes(form)).map((r) => {
       const d = DEFAULTS[r.kind] ?? DEFAULTS.remote;
       return {
@@ -78,6 +81,7 @@ export function createJobLane({ stats, routes, record = () => {}, saveStats = ()
         networkMs: r.networkMs ?? d.networkMs,
         serviceMs: observedMs.get(r.id) ?? r.serviceMs ?? d.serviceMs,
         measuredService: observedMs.has(r.id),
+        inputTokens: r.inputTokens ?? inputTokens,
       };
     });
 
@@ -112,8 +116,13 @@ export function createJobLane({ stats, routes, record = () => {}, saveStats = ()
       khoraUrl: context.khoraUrl, fetchImpl: context.fetchImpl,
     };
 
-    const trace = await runJob(job, {
-      routes: rs, stats, execute, ctx, explore, exposurePenaltyMs,
+    // The void loop (src/void.js) and the composite cut (src/compose.js): DEF the void from the
+    // job's acceptance closure, EVA each proposal's satisfaction, REC onto the next giver, and
+    // learn WHO IS GOOD AT WHAT. A composite job is pulled apart by capability (tool-calling vs
+    // generation), each part chased on its own, and the outputs MERGED BY THE SYSTEM (never a
+    // model); the whole is then EVA'd after assembly. A job with no acceptance defines no void.
+    const trace = await compose(job, {
+      routes: rs, stats, comp, execute, ctx, explore, exposurePenaltyMs, ctxTokens: inputTokens,
       record: ({ job: j, attempt, route }) => {
         record({ job: j, route, attempt });
       },
@@ -123,10 +132,14 @@ export function createJobLane({ stats, routes, record = () => {}, saveStats = ()
     return {
       status: 200,
       body: {
-        jobId: trace.jobId, disclosure: disclosureOf(job), form, state: trace.final.state,
+        jobId: trace.jobId, disclosure: disclosureOf(job), routing: routingOf(job), form, state: trace.final.state,
+        composite: trace.composite ?? false,
         route: trace.final.route ?? last?.route ?? null,
         proposal: trace.final.proposal ?? null,
-        acceptance: last?.acceptance ?? null,
+        acceptance: trace.final.acceptance ?? last?.acceptance ?? null,
+        parts: trace.parts ?? null,
+        merged: trace.merged ?? null,
+        void: trace.void ?? null,
         gap: trace.final.gap ?? null,
         attempts: trace.attempts.map((a) => ({ n: a.n, route: a.route, trust: a.trust, exposure: a.exposure, chosenBy: a.chosenBy, verdict: a.verdict, failureKind: a.failureKind, ms: a.ms, tokens: a.tokens, error: a.error, escalation: a.escalation ?? null, acceptance: a.acceptance })),
         decision: trace.attempts.map((a) => ({ n: a.n, candidates: a.candidates, excluded: a.excluded })),

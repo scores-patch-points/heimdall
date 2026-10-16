@@ -13,6 +13,13 @@
 //                       score = (Q + N + S) / P  [+ exposurePenaltyMs]
 //                Q queue wait · N network/TTFT · S processing · P the route's
 //                measured accept rate for this task class (route-stats.js).
+//                A job whose `routing` is "cheapest" (or whose `objective` is
+//                "batch") minimizes expected COST per accepted answer instead:
+//                       score = C / P      C = the route's cost for this job
+//                so a free local model that passes 40% can beat a paid one that
+//                passes 90%, and the job's own acceptance checks are the only
+//                thing certifying the cheaper answer as good. An unpriced
+//                external route is never assumed free (costTerms).
 //   4. ESCALATE  `escalate(job, attempt, …)` — ONLY on an observable failure:
 //                check_failed · contradiction · unresolved · capability_missing ·
 //                deadline_risk · route_error. A model's self-reported
@@ -31,7 +38,7 @@
 // are all injected. `runJob` is the orchestrator the bridge and the simulator
 // share.
 
-import { DISCLOSURE, FAILURE_KINDS, disclosureOf, disclosureRank, capabilitiesOf, satisfies } from "./job.js";
+import { DISCLOSURE, FAILURE_KINDS, disclosureOf, disclosureRank, capabilitiesOf, satisfies, routingOf } from "./job.js";
 import { runAcceptance } from "./acceptance.js";
 
 /** Where a route lives: its trust domain. */
@@ -89,36 +96,88 @@ export function timeTerms(route, job) {
   return { Q, N, S, raw: Q + N + S };
 }
 
+/** The cost of ONE attempt on this route for this job, in USD. A route declares
+ *  its price one of three ways, most explicit first:
+ *    · usd            a flat cost per attempt (the caller already knows the payload size)
+ *    · usdInPerM/usdOutPerM  per-million-token pricing, charged on route.inputTokens
+ *                       and route.outputTokens (or the job's own output.maxTokens)
+ *  A local or private-fleet route is FREE: nothing it does leaves the machine,
+ *  so it costs nothing to try. An external route with no declared price is
+ *  UNPRICED — never assumed free, because "unknown" must never win a cheapest
+ *  lane on a rumor (the same rule route-stats.js applies to an unmeasured P). */
+export function costTerms(route, job) {
+  if (route.trust !== "external") return { usd: 0, priced: true };
+  if (Number.isFinite(route.usd)) return { usd: route.usd, priced: true };
+  if (Number.isFinite(route.usdInPerM) || Number.isFinite(route.usdOutPerM)) {
+    const inTok = num(route.inputTokens, 0);
+    const outTok = num(route.outputTokens, num(job.output?.maxTokens, 500));
+    return { usd: (inTok * num(route.usdInPerM, 0) + outTok * num(route.usdOutPerM, 0)) / 1e6, priced: true };
+  }
+  return { usd: null, priced: false };
+}
+
 /**
  * STEP 3 — choose by measured performance.
- *   score = (Q + N + S) / P  +  exposurePenaltyMs · rank(exposure)
+ *   routing "fastest"   score = (Q + N + S) / P  +  exposurePenaltyMs · rank(exposure)
+ *   routing "cheapest"  order by C / P, priced routes before unpriced, exposure
+ *                       as the tie-break, then time   (C = costTerms, ms)
+ * On the LAST attempt of a cheapest job (`attemptsLeft <= 1`) cost stops
+ * mattering: the pick is by measured accept probability (P), then time — a free
+ * lane that keeps failing must not spend the whole budget before a lane that can
+ * actually answer is ever tried.
  * `stats` is a route-stats object; P is its Laplace-smoothed accept rate for
  * (route, job.taskClass). `explore: "thompson"` draws P from the Beta posterior
  * instead (the lock-in cure, measured in scripts/route-sim.mjs).
  * Deadline: with `job.deadlineMs` and `elapsedMs`, routes whose RAW time cannot
  * fit the remaining budget are set aside unless every route is at risk.
- * Returns { route|null, reason, scores[], excluded[], atRisk }.
+ * Returns { route|null, reason, routing, scores[], excluded[], atRisk }.
  */
-export function choose(job, routes, stats, { exclude = new Set(), elapsedMs = 0, exposurePenaltyMs = 0, explore = "greedy", rng = Math.random } = {}) {
+export function choose(job, routes, stats, { exclude = new Set(), elapsedMs = 0, exposurePenaltyMs = 0, explore = "greedy", rng = Math.random, attemptsLeft = Infinity } = {}) {
+  const routing = routingOf(job);
   const { eligible: cands, excluded } = eligible(job, routes, { exclude });
-  if (!cands.length) return { route: null, reason: "no_eligible_route", scores: [], excluded, atRisk: false };
+  if (!cands.length) return { route: null, reason: "no_eligible_route", routing, scores: [], excluded, atRisk: false };
   const remaining = job.deadlineMs != null ? job.deadlineMs - elapsedMs : Infinity;
   const scores = cands.map((route) => {
     const t = timeTerms(route, job);
     const rate = stats.acceptRate(route.id, job.taskClass);
     const P = explore === "thompson" ? stats.sampleRate(route.id, job.taskClass, rng) : rate.p;
+    const cost = costTerms(route, job);
     const exp = disclosureRank(exposureOf(route));
-    return { route: route.id, trust: route.trust, exposure: exposureOf(route), ...t, P: +P.toFixed(4), measured: rate.n, score: Math.round(t.raw / Math.max(P, 0.01) + exposurePenaltyMs * exp), fitsDeadline: t.raw <= remaining };
+    const expectedMs = Math.round(t.raw / Math.max(P, 0.01));
+    // expected cost per ACCEPTED answer: the unit cost divided by the accept rate,
+    // exactly as time-to-accepted divides service time by it. null = unpriced.
+    const expectedUsd = cost.priced ? cost.usd / Math.max(P, 0.01) : null;
+    return {
+      route: route.id, trust: route.trust, exposure: exposureOf(route), ...t,
+      usd: cost.usd, priced: cost.priced, expectedUsd, expectedMs,
+      P: +P.toFixed(4), measured: rate.n,
+      score: Math.round(routing === "cheapest" ? (expectedUsd ?? Infinity) * 1e6 : t.raw / Math.max(P, 0.01) + exposurePenaltyMs * exp),
+      fitsDeadline: t.raw <= remaining,
+    };
   });
-  const order = (a, b) => a.score - b.score || disclosureRank(a.exposure) - disclosureRank(b.exposure) || (a.route < b.route ? -1 : 1);
+  const byId = (a, b) => (a.route < b.route ? -1 : a.route > b.route ? 1 : 0);
+  const expRank = (a, b) => disclosureRank(a.exposure) - disclosureRank(b.exposure);
+  // cheapest: priced before unpriced, then lower expected cost, preferring the
+  // route that keeps bytes closer to home on a tie, then the sooner one.
+  const byCost = (a, b) => (a.priced === b.priced ? 0 : a.priced ? -1 : 1) || (a.expectedUsd ?? Infinity) - (b.expectedUsd ?? Infinity) || expRank(a, b) || a.expectedMs - b.expectedMs || byId(a, b);
+  // last attempt: maximize the chance of an answer — highest accept probability,
+  // then time (fastest's own tie-break), then cost — so a field of cheap lanes
+  // that keep failing can never consume the whole budget before a lane that can
+  // accept is tried.
+  const byChance = (a, b) => b.P - a.P || a.expectedMs - b.expectedMs || (a.expectedUsd ?? Infinity) - (b.expectedUsd ?? Infinity) || expRank(a, b) || byId(a, b);
+  const order = routing !== "cheapest"
+    ? (a, b) => a.score - b.score || expRank(a, b) || byId(a, b)
+    : attemptsLeft <= 1
+      ? byChance
+      : byCost;
   scores.sort(order);
   const fits = scores.filter((s) => s.fitsDeadline);
   const pool = fits.length ? fits : [...scores].sort((a, b) => a.raw - b.raw || order(a, b)); // all at risk → the fastest raw time
   const best = pool[0];
   return {
     route: cands.find((r) => r.id === best.route),
-    reason: !fits.length ? "deadline_risk_all_routes" : (job.model ? "pinned_model" : "expected_time_to_accepted"),
-    scores, excluded, atRisk: !fits.length,
+    reason: !fits.length ? "deadline_risk_all_routes" : job.model ? "pinned_model" : routing === "cheapest" ? (attemptsLeft <= 1 ? "expected_cost_to_accepted:last_attempt" : "expected_cost_to_accepted") : "expected_time_to_accepted",
+    routing, scores, excluded, atRisk: !fits.length,
   };
 }
 
@@ -181,8 +240,10 @@ export async function runJob(inputJob, { routes, stats, execute, ctx = {}, recor
   let nextRoute = null;
   let because = null;
 
-  for (let n = 1; n <= (job.maxAttempts ?? 3); n++) {
-    const decision = nextRoute ?? choose(job, routes, stats, { exclude: new Set(tried), elapsedMs, exposurePenaltyMs, explore, rng });
+  const maxAttempts = job.maxAttempts ?? 3;
+  for (let n = 1; n <= maxAttempts; n++) {
+    const attemptsLeft = maxAttempts - n + 1;
+    const decision = nextRoute ?? choose(job, routes, stats, { exclude: new Set(tried), elapsedMs, exposurePenaltyMs, explore, rng, attemptsLeft });
     nextRoute = null;
     if (!decision.route) {
       const gap = { kind: "not-present", about: `no eligible route under disclosure ${disclosure}`, excluded: decision.excluded };
@@ -209,7 +270,8 @@ export async function runJob(inputJob, { routes, stats, execute, ctx = {}, recor
     stats.record(route.id, job.taskClass, verdict);
     const entry = {
       n, route: route.id, trust: route.trust, exposure: exposureOf(route), chosenBy: because ? `escalation:${because}` : decision.reason,
-      candidates: (decision.scores || []).map((s) => ({ route: s.route, score: s.score, P: s.P, Q: s.Q, N: s.N, S: s.S, raw: s.raw })),
+      routing: decision.routing,
+      candidates: (decision.scores || []).map((s) => ({ route: s.route, score: s.score, P: s.P, Q: s.Q, N: s.N, S: s.S, raw: s.raw, usd: s.usd, priced: s.priced, expectedUsd: s.expectedUsd, expectedMs: s.expectedMs })),
       excluded: decision.excluded || [], ms, tokens: out?.tokens ?? null, error: out?.error ?? null,
       proposal: out?.error ? null : { proposal: out?.proposal, route: route.id, checksToRun: (job.acceptance || []).map((c, i) => ({ id: c.id ?? `a${i + 1}`, type: c.type })) },
       acceptance: acceptance ? { state: acceptance.state, accepted: acceptance.accepted, failures: acceptance.failures, gaps: acceptance.gaps, verdicts: acceptance.verdicts } : null,
@@ -222,7 +284,7 @@ export async function runJob(inputJob, { routes, stats, execute, ctx = {}, recor
     if (acceptance?.accepted) return { jobId: job.id, disclosure, attempts, final: { state: "accepted", route: route.id, proposal: out.proposal, elapsedMs } };
     if (acceptance?.state === "unverified") return { jobId: job.id, disclosure, attempts, final: { state: "unverified", route: route.id, proposal: out.proposal, elapsedMs, gap: { kind: "not-computed", about: "a check could not run; the proposal is shown, not accepted", verdicts: acceptance.verdicts.filter((v) => v.verdict === "gap") } } };
 
-    const esc = escalate(job, { route: route.id, outcome: kind && !failureKindOf(outcome) ? { kind } : outcome, n, tried, elapsedMs }, routes, stats, { exposurePenaltyMs, explore, rng });
+    const esc = escalate(job, { route: route.id, outcome: kind && !failureKindOf(outcome) ? { kind } : outcome, n, tried, elapsedMs }, routes, stats, { exposurePenaltyMs, explore, rng, attemptsLeft: maxAttempts - n });
     entry.escalation = { escalate: esc.escalate, kind: esc.kind, reason: esc.reason, to: esc.next?.route?.id ?? null };
     if (!esc.escalate) return { jobId: job.id, disclosure, attempts, final: { state: acceptance?.state === "rejected" || acceptance?.state === "unresolved" ? "rejected" : "failed", route: route.id, reason: esc.reason, gap: esc.gap ?? null, elapsedMs } };
     nextRoute = esc.next;

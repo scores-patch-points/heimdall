@@ -53,6 +53,11 @@ export const TASK_CLASSES = Object.freeze({
     capability: "composition",
     label: "a program that satisfies a falsifying gate",
   },
+  "mechanical.tool": {
+    family: "mechanical",
+    capability: "native-tools",
+    label: "emit a tool call the executor can run — pulled apart from generation",
+  },
   "mechanical.compute": {
     family: "mechanical",
     capability: "compute",
@@ -102,6 +107,20 @@ export const PRIVACY = Object.freeze(["local-raw", "sealed-external"]);
 
 export const OBJECTIVE = Object.freeze(["interactive", "batch"]);
 
+/** ROUTING — the objective the router minimizes (src/escalation.js `choose`).
+ *    fastest   minimize expected time-to-accepted  (E[T_accepted] = T / P)
+ *    cheapest  minimize expected cost-per-accepted (E[$_accepted] = $ / P)
+ *  The cheapest mode is the one that needs a good answer defined up front: its
+ *  only defence against a cheap wrong answer is the job's own local `acceptance`
+ *  checks, which certify or reject each proposal before it is kept. */
+export const ROUTING = Object.freeze(["fastest", "cheapest"]);
+
+/** How a COMPOSITE job's part proposals are merged — by the SYSTEM, never a model.
+ *    byPart  { byPart: { <id>: proposal }, text }   (default)
+ *    text    same, with `text` the concatenation of each part's text
+ *    fields  additionally flatten each object part's keys onto the merged object */
+export const MERGE_RULES = Object.freeze(["byPart", "text", "fields"]);
+
 export const EFFECTS = Object.freeze([
   "observe",
   "mutate-local",
@@ -130,6 +149,14 @@ export const disclosureRank = (d) => DISCLOSURE.indexOf(d);
 export function disclosureOf(job) {
   if (job?.disclosure != null) return job.disclosure;
   return job?.privacy === "local-raw" ? "none" : "sealed-external-text";
+}
+
+/** The routing objective: explicit when declared, else derived from `objective`
+ *  so every pre-existing job keeps its meaning (batch already means "may trade
+ *  time for money/energy"). */
+export function routingOf(job) {
+  if (job?.routing != null) return job.routing;
+  return job?.objective === "batch" ? "cheapest" : "fastest";
 }
 
 /** The typed acceptance checks the Fold runs LOCALLY on a returned proposal
@@ -215,6 +242,9 @@ export function makeJob({
   disclosure = null,
   acceptance = [],
   maxAttempts = 3,
+  routing = null,
+  parts = null,
+  merge = "byPart",
 } = {}) {
   return {
     schema: SCHEMA,
@@ -237,6 +267,13 @@ export function makeJob({
     disclosure: disclosure ?? (privacy === "local-raw" ? "none" : "sealed-external-text"),
     acceptance,
     maxAttempts,
+    // the routing objective (2026-10): null means "derive from objective", so an
+    // old job is routed exactly as before.
+    routing,
+    // a COMPOSITE job: parts pulled apart by capability, each routed on its own
+    // and MERGED by the system (src/compose.js). null = a single whole.
+    parts,
+    merge,
   };
 }
 
@@ -248,6 +285,7 @@ export function validateJob(job) {
   if (!job.id) errors.push("missing id");
   if (!isTaskClass(job.taskClass)) errors.push(`unknown taskClass ${job.taskClass}`);
   if (!OBJECTIVE.includes(job.objective)) errors.push(`objective must be one of ${OBJECTIVE.join("|")}`);
+  if (job.routing != null && !ROUTING.includes(job.routing)) errors.push(`routing must be one of ${ROUTING.join("|")}`);
   if (!PRIVACY.includes(job.privacy)) errors.push(`privacy must be one of ${PRIVACY.join("|")}`);
   for (const e of job.effects || []) if (!EFFECTS.includes(e)) errors.push(`unknown effect ${e}`);
   for (const r of job.requires || []) if (!DOOR_CAPABILITIES[r]) errors.push(`unknown door ${r}`);
@@ -273,5 +311,15 @@ export function validateJob(job) {
     });
   }
   if (job.maxAttempts != null && !(Number.isInteger(job.maxAttempts) && job.maxAttempts >= 1 && job.maxAttempts <= 10)) errors.push("maxAttempts must be an integer 1..10");
+  if (job.merge != null && !MERGE_RULES.includes(job.merge)) errors.push(`merge must be one of ${MERGE_RULES.join("|")}`);
+  if (job.parts != null) {
+    if (!Array.isArray(job.parts) || !job.parts.length) errors.push("parts must be a non-empty array of part specs");
+    else job.parts.forEach((p, i) => {
+      if (!p || typeof p !== "object") errors.push(`parts[${i}] must be an object`);
+      else if (!isTaskClass(p.taskClass)) errors.push(`parts[${i}].taskClass must be a known task class`);
+      else if (p.acceptance != null && !Array.isArray(p.acceptance)) errors.push(`parts[${i}].acceptance must be an array`);
+      else if (p.requires != null && !Array.isArray(p.requires)) errors.push(`parts[${i}].requires must be an array`);
+    });
+  }
   return errors.length ? { ok: false, errors } : { ok: true, errors: [] };
 }
