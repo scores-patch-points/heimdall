@@ -48,6 +48,7 @@ import {
   guessTag, resolveLink, linkAdvertisedModels, normalizeUrl, isMetadataHost, LINK_SKIP_MS, DEFAULT_LINKS_FILE,
 } from "./links.mjs";
 import { inferOn } from "./remote.js";
+import { sealedFetch } from "./sealed-fetch.js";
 import { record as dispatchRecord, meter as dispatchMeter, ESTIMATE_COSTS } from "./dispatch.js";
 import { code as opencodeCode } from "./opencode-lane.js";
 import { createJobLane } from "./job-lane.js";
@@ -163,7 +164,7 @@ export function createBridge({
   routeStatsFile = DEFAULT_STATS_FILE, // per route × taskClass accept rates for POST /api/job (injectable; null = memory only)
   jobRoutes = null, // test seam: (form) => routes for POST /api/job; null builds them from the live lanes
   extraJobRoutes = null, // (form) => extra routes appended to the live ones (e.g. a remote reached through ANOTHER bridge)
-  frontierFetch = fetch,
+  frontierFetch = sealedFetch,
   // The measured-competence table the dispatcher plans from (competence.js). Persisted so what was learned survives a restart.
   competenceFile = path.join(os.homedir(), ".heimdall", "competence.json"),
   competence = null,
