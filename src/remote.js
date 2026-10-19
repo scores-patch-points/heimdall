@@ -16,6 +16,7 @@
 import { probeInferenceAuth } from "./discovery.js";
 import { joinBase } from "./url.js";
 import { isHostedOpen } from "./hosted.js";
+import { sealedFetch } from "./sealed-fetch.js";
 import { VERTEX_PATH, resolveKey } from "./vertex.js";
 
 /** One completion on an OpenAI-compatible lane. Resolves
@@ -67,7 +68,7 @@ function boundSignal(timeoutMs, firstByteMs) {
 const NO_TEMPERATURE = new Set();
 const NO_TEMPERATURE_RE = /^claude-sonnet-5(-5)?(-|$)/;
 export const rejectsTemperature = (model) => NO_TEMPERATURE.has(model) || NO_TEMPERATURE_RE.test(String(model));
-export async function chatOpenAI({ base, model, key = null, messages = [], temperature = 0.7, maxTokens = 1024, stream = true, onToken = null, fetchImpl = fetch, timeoutMs = 120_000, firstByteMs = 0, signal = null, includeUsage = false, path = "/v1/chat/completions" } = {}) {
+export async function chatOpenAI({ base, model, key = null, messages = [], temperature = 0.7, maxTokens = 1024, stream = true, onToken = null, fetchImpl = sealedFetch, timeoutMs = 120_000, firstByteMs = 0, signal = null, includeUsage = false, path = "/v1/chat/completions" } = {}) {
   const url = joinBase(base, path);
   const headers = { "content-type": "application/json" };
   if (key) headers.authorization = `Bearer ${key}`;
@@ -129,7 +130,7 @@ export async function chatOpenAI({ base, model, key = null, messages = [], tempe
 }
 
 /** One completion on an Ollama lane. */
-export async function chatOllama({ base, model, key = null, messages = [], temperature = 0.7, maxTokens = 1024, onToken = null, fetchImpl = fetch, timeoutMs = 120_000, firstByteMs = 0 } = {}) {
+export async function chatOllama({ base, model, key = null, messages = [], temperature = 0.7, maxTokens = 1024, onToken = null, fetchImpl = sealedFetch, timeoutMs = 120_000, firstByteMs = 0 } = {}) {
   const url = `${String(base).replace(/\/+$/, "")}/api/chat`;
   const headers = { "content-type": "application/json" };
   if (key) headers.authorization = `Bearer ${key}`;
@@ -210,7 +211,7 @@ export async function chatPuter({ model, messages = [], temperature = 0.7, maxTo
  *  `content[].text`. Same { text, ms, ttft, tokens, status } shape as the
  *  other lanes, so executors.js learns capacity identically. Streaming parses
  *  the `content_block_delta` events. */
-export async function chatAnthropic({ base, model, key = null, messages = [], temperature = 0.7, maxTokens = 1024, stream = true, onToken = null, fetchImpl = fetch, timeoutMs = 120_000, firstByteMs = 0 } = {}) {
+export async function chatAnthropic({ base, model, key = null, messages = [], temperature = 0.7, maxTokens = 1024, stream = true, onToken = null, fetchImpl = sealedFetch, timeoutMs = 120_000, firstByteMs = 0 } = {}) {
   const url = `${String(base).replace(/\/+$/, "")}/v1/messages`;
   const headers = { "content-type": "application/json", "anthropic-version": "2023-06-01" };
   if (key) headers["x-api-key"] = key;
@@ -283,7 +284,7 @@ export async function chatAnthropic({ base, model, key = null, messages = [], te
 /** Dispatch one job to an executor record, on the wire its provider speaks.
  *  Returns the chat result; throws with { timedOut, status, beforeFirstToken }
  *  on failure so executors.js can learn capacity. */
-export async function inferOn(exec, { messages = [], temperature = 0.7, maxTokens = 1024, onToken = null, fetchImpl = fetch, firstByteMs = 0, timeoutMs, signal = null } = {}) {
+export async function inferOn(exec, { messages = [], temperature = 0.7, maxTokens = 1024, onToken = null, fetchImpl = sealedFetch, firstByteMs = 0, timeoutMs, signal = null } = {}) {
   const auth = exec.auth;
   const bound = { firstByteMs, ...(timeoutMs ? { timeoutMs } : {}) };
   const key = auth?.apiKey ?? auth?.bearerKey ?? exec.apiKey ?? null;
