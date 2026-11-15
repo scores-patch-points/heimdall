@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>pharos surface: browser node</title>
+<script type="importmap">{ "imports": { "@matrix-org/matrix-sdk-crypto-wasm": "/app/node_modules/@matrix-org/matrix-sdk-crypto-wasm/index.mjs" } }</script>
+<style>body{font:14px/1.4 ui-monospace,monospace;margin:16px;background:#fff;color:#111}pre{white-space:pre-wrap}</style>
+</head><body>
+<h1>Browser node</h1>
+<p>Matrix crypto in the browser (state in IndexedDB), records in OPFS and in IndexedDB, exchanged with the on-device server.</p>
+<pre id="out">running…</pre>
+<script type="module">
+import { MatrixDevice } from '/app/lib/matrix.mjs';
+import { opfsStore, idbStore, remoteStore, exchange } from '/app/lib/stores.mjs';
+import { Network } from '/app/lib/network.mjs';
+const out = document.getElementById('out'), log = [];
+const say = (k, v) => { log.push([k, v]); out.textContent = log.map(([a, b]) => `${a}: ${typeof b === 'string' ? b : JSON.stringify(b)}`).join('\n'); };
+window.__result = { done: false, steps: log };
+try {
+  const cfg = await (await fetch('/v1/test-config')).json();
+  const mx = await new MatrixDevice(cfg.hs).login(cfg.user, cfg.pw, 'ana browser', { storeName: 'heimdall-crypto', storePassphrase: cfg.cryptoPass });
+  say('matrix device', mx.deviceId);
+  await mx.join(cfg.room);                       // already a link; this registers the room's encryption settings on this device
+  const opfs = opfsStore(), idb = idbStore();
+  const inOpfs = new Network({ mx, store: opfs, roomId: cfg.room });
+  const inIdb = new Network({ mx, store: idb, roomId: cfg.room });
+  say('opfs write', await inOpfs.write({ note: 'written in Chrome, kept in OPFS' }));
+  say('idb write', await inIdb.write({ note: 'written in Chrome, kept in IndexedDB' }));
+  say('opfs read', (await inOpfs.read()).map((r) => r.ok ? r.plaintext.note : 'locked: ' + r.why));
+  say('idb read', (await inIdb.read()).map((r) => r.ok ? r.plaintext.note : 'locked: ' + r.why));
+  const raw = JSON.stringify(await opfs.list()) + JSON.stringify(await idb.list());
+  say('plaintext at rest in browser stores', /written in Chrome/.test(raw));
+  const remote = remoteStore({ url: location.origin, pairingToken: cfg.pairingToken });
+  say('exchange opfs <-> device server', await exchange(opfs, remote));
+  say('exchange idb <-> device server', await exchange(idb, remote));
+  say('opfs after exchange (decryptable here)', (await inOpfs.read()).map((r) => r.ok ? r.plaintext.note : 'locked: ' + r.why.slice(0, 60)));
+  say('opfs info', await opfs.info()); say('idb info', await idb.info()); say('server info', await remote.info());
+  window.__result.done = true; window.__result.ok = true;
+} catch (e) { say('ERROR', String(e?.stack || e)); window.__result.done = true; window.__result.ok = false; }
+</script>
+</body></html>

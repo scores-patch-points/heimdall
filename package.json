@@ -7,11 +7,12 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test": "node --test",
+    "test": "node --test src/",
     "preview": "vite preview",
     "icons": "node scripts/gen-icons.mjs",
     "invite": "node bin/heimdall.mjs invite",
-    "up": "node bin/heimdall.mjs up"
+    "up": "node bin/heimdall.mjs up",
+    "test:bridges": "cd bridges && npm test"
   },
   "bin": {
     "heimdall": "./bin/heimdall.mjs"
