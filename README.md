@@ -5,6 +5,14 @@ Distributed local inference. You get a link. Anyone who opens it and presses
 collectively. Their device downloads a small model, runs it locally in the
 browser, and streams answers back to you.
 
+> **New (2026-11): Heimdall is also integration and sync for pharos.** Pharos is the
+> substrate: one append-only log on each node. Heimdall stands at each bridge between a
+> node and something else (another node, a network of people, a database, the fediverse,
+> a signaling server), probes it, and carries across what is waiting. That work is in
+> [`bridges/`](bridges/README.md). It includes a tool to install your own signaling
+> server, so nobody has to ride on someone else's Matrix account or server. Everything
+> below this note describes the distributed-inference work, which is unchanged.
+
 > **The whole map:** [ACTIVITIES.md](ACTIVITIES.md) documents every layer of
 > heimdall's work — the doors, the gate, the degradation ladder (a higher
 > rung that breaks steps down to the next and the record shows the drop), the

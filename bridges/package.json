@@ -1,0 +1,16 @@
+{
+  "name": "heimdall-bridges",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Heimdall bridges: integration and sync for pharos nodes. Matrix (accounts, networks, end-to-end encryption, sync), ActivityPub, databases, public repos and APIs. Pharos is the substrate; Heimdall stores nothing, he carries.",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "dependencies": {
+    "@matrix-org/matrix-sdk-crypto-wasm": "18.9.0"
+  }
+}
