@@ -1,0 +1,15 @@
+{
+  "name": "Heimdall intake (example: GitHub repo)",
+  "nodes": [
+    { "parameters": {}, "id": "a1", "name": "Run manually", "type": "n8n-nodes-base.manualTrigger", "typeVersion": 1, "position": [0, 0] },
+    { "parameters": { "url": "https://api.github.com/repos/lerocha/chinook-database", "options": {} }, "id": "a2", "name": "Fetch", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.4, "position": [220, 0] },
+    { "parameters": { "jsCode": "// Shape every incoming item for Heimdall. Keep a stable key; never copy auth headers into value.\nreturn [{ json: {\n  source: { system: 'n8n', workflow: String($workflow.id), workflowName: $workflow.name, execution: String($execution.id) },\n  items: $input.all().map(i => ({ key: String(i.json.id ?? i.json.name), value: i.json }))\n} }];" }, "id": "a3", "name": "Shape for Heimdall", "type": "n8n-nodes-base.code", "typeVersion": 2, "position": [440, 0] },
+    { "parameters": { "method": "POST", "url": "http://127.0.0.1:7421/api/intake", "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify($json) }}", "options": {} }, "id": "a4", "name": "Send to Heimdall", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.4, "position": [660, 0], "credentials": { "httpHeaderAuth": { "id": "", "name": "Heimdall intake" } } }
+  ],
+  "connections": {
+    "Run manually": { "main": [[{ "node": "Fetch", "type": "main", "index": 0 }]] },
+    "Fetch": { "main": [[{ "node": "Shape for Heimdall", "type": "main", "index": 0 }]] },
+    "Shape for Heimdall": { "main": [[{ "node": "Send to Heimdall", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "saveDataSuccessExecution": "none", "saveDataErrorExecution": "all" }
+}

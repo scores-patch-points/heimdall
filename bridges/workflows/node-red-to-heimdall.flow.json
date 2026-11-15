@@ -1,0 +1,8 @@
+[
+  { "id": "n1", "type": "inject", "z": "f1", "name": "Run", "props": [], "once": false, "x": 110, "y": 80, "wires": [["n2"]] },
+  { "id": "n2", "type": "http request", "z": "f1", "name": "Fetch", "method": "GET", "ret": "obj", "url": "https://api.github.com/repos/lerocha/chinook-database", "headers": [{ "keyType": "other", "keyValue": "User-Agent", "valueType": "other", "valueValue": "node-red" }], "x": 270, "y": 80, "wires": [["n3"]] },
+  { "id": "n3", "type": "function", "z": "f1", "name": "Shape for Heimdall", "func": "// Stable key; never copy auth headers into value.\nconst v = msg.payload;\nmsg.headers = { 'content-type': 'application/json', 'x-heimdall-token': env.get('HEIMDALL_INTAKE_TOKEN') };\nmsg.payload = { source: { system: 'node-red', workflow: node.z, workflowName: 'Heimdall intake (example)' }, items: [{ key: String(v.id ?? v.name), value: v }] };\nreturn msg;", "outputs": 1, "x": 470, "y": 80, "wires": [["n4"]] },
+  { "id": "n4", "type": "http request", "z": "f1", "name": "Send to Heimdall", "method": "POST", "ret": "obj", "url": "http://127.0.0.1:7421/api/intake", "x": 690, "y": 80, "wires": [["n5"]] },
+  { "id": "n5", "type": "debug", "z": "f1", "name": "Result", "active": true, "complete": "payload", "x": 870, "y": 80, "wires": [] },
+  { "id": "f1", "type": "tab", "label": "Heimdall intake" }
+]

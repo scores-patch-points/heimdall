@@ -5,7 +5,8 @@
   "type": "module",
   "description": "Heimdall bridges: integration and sync for pharos nodes. Matrix (accounts, networks, end-to-end encryption, sync), ActivityPub, databases, public repos and APIs. Pharos is the substrate; Heimdall stores nothing, he carries.",
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "ui": "node ui/serve.mjs"
   },
   "engines": {
     "node": ">=22.5"

@@ -63,3 +63,11 @@ Not tested, or not built:
 - The signaling server still sees who is in whose network, and when.
 
 The design, field by field, with what each kind of database and each federated system would need, is in [CODECS.md](CODECS.md).
+
+## The UI and workflow intake
+
+```
+HEIMDALL_INTAKE_TOKEN=$(openssl rand -hex 24) node ui/serve.mjs --pharos <pharos>/lib/pharos.mjs --dir <log dir> --write
+```
+
+`ui/` draws sources, the kept record and destinations from a pharos log (read-only unless started with `--write`). **Add a source** previews a web address (fields, where each would land) before anything is woven. `POST /api/intake` is the one endpoint any workflow tool ends with (n8n, Node-RED, Activepieces, curl): the tool holds the credentials, Heimdall weaves each item as a `pulled` entry under its own writer name, and refuses anything that looks like a credential. Contract: `ui/INTAKE.md`. Starter flows for n8n and Node-RED: `workflows/` (not yet imported into a running tool).
