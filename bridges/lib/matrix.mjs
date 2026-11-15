@@ -18,6 +18,7 @@ import * as M from '@matrix-org/matrix-sdk-crypto-wasm';
 export const SIGNAL = 'org.heimdall.signal';        // to-device: "records available", never their content
 export const KEYS = 'org.heimdall.room_keys';        // to-device: exported Megolm keys for history the owner chooses to share
 export const RECORD = 'org.heimdall.record';         // the event type inside the Megolm ciphertext
+export const CARRY = 'org.heimdall.carry';             // to-device: one carried payload, or the manifest of its shards in the media store
 let inited = false;
 async function init() { if (!inited) { await M.initAsync(); inited = true; } }
 
@@ -122,7 +123,7 @@ export class MatrixDevice {
     const processed = await this.machine.receiveSyncChanges(JSON.stringify(json.to_device?.events ?? []), new M.DeviceLists(changed, left), otk, fb);
     for (const p of processed) {
       const raw = JSON.parse(p.rawEvent);
-      if (raw.type === SIGNAL || raw.type === KEYS) this.toDeviceInbox.push({ ...raw, verified: p.encryptionInfo ? true : false });
+      if (raw.type === SIGNAL || raw.type === KEYS || raw.type === CARRY) this.toDeviceInbox.push({ ...raw, verified: p.encryptionInfo ? true : false, senderDevice: p.encryptionInfo?.senderDevice?.toString() ?? null });
     }
     for (const [roomId, r] of Object.entries(json.rooms?.join ?? {})) {
       for (const ev of [...(r.state?.events ?? []), ...(r.timeline?.events ?? [])]) if (ev.type === 'm.room.member') this.noteMember(roomId, ev);
@@ -213,13 +214,15 @@ export class MatrixDevice {
   }
 
   // Olm-encrypted to-device message to every device of one user (ephemeral on the homeserver).
-  async toUser(userId, type, content) {
+  // Never to this device itself. `onlyDevice` narrows to one device of that user.
+  async toUser(userId, type, content, { onlyDevice = null } = {}) {
     const uid = () => new M.UserId(userId);
     await this.machine.updateTrackedUsers([uid()]);
-    await this.flush();
+    await this.refreshDevices(userId);                 // a device added since the last look must not be missed
     const claim = await this.machine.getMissingSessions([uid()]);
     if (claim) await this.send(claim);
-    const devs = (await this.machine.getUserDevices(uid(), 5)).devices();
+    const devs = (await this.machine.getUserDevices(uid(), 5)).devices()
+      .filter((d) => !(userId === this.userId && d.deviceId.toString() === this.deviceId) && (!onlyDevice || d.deviceId.toString() === onlyDevice));
     const messages = { [userId]: {} };
     for (const d of devs) messages[userId][d.deviceId.toString()] = JSON.parse(await d.encryptToDeviceEvent(type, content));
     if (!devs.length) throw new Error(`no devices known for ${userId}`);
@@ -275,6 +278,14 @@ export class MatrixDevice {
     await this.machine.receiveSyncChanges('[]', new M.DeviceLists([new M.UserId(userId)], []), new Map(), undefined);
     await this.flush();
   }
+  // Is this one of my own devices, vouched for by my self-signing key? (For messages that arrived Olm-encrypted,
+  // where the library has already tied the message to that device's key.)
+  async isOwnTrustedDevice(deviceId) {
+    if (!deviceId || deviceId === this.deviceId) return false;
+    let dev = await this.machine.getDevice(new M.UserId(this.userId), new M.DeviceId(deviceId), 5);
+    for (let i = 0; i < 3 && (!dev || !dev.isCrossSignedByOwner()); i++) { await this.refreshDevices(this.userId); dev = await this.machine.getDevice(new M.UserId(this.userId), new M.DeviceId(deviceId), 5); }
+    return !!dev && dev.isCrossSignedByOwner();
+  }
   // The owner's device with the self-signing key vouches for another of the owner's devices.
   async crossSignOwnDevice(deviceId) {
     // a new device reaches this one through sync (device_lists.changed), then a keys/query
@@ -286,6 +297,27 @@ export class MatrixDevice {
     if (!dev) throw new Error(`device ${deviceId} not found`);
     await this.send(await dev.verify());
     await this.flush();
+  }
+
+  // ---------- the media store: ciphertext only, for a peer who is offline and a payload too large to queue ----------
+  // Matrix's own encrypted-attachment scheme (AES-256-CTR, sha256 of the ciphertext), from the crypto library.
+  sealAttachment(bytes) { const a = M.Attachment.encrypt(bytes); return { data: a.encryptedData, info: a.mediaEncryptionInfo }; }
+  openAttachment(data, info) { return M.Attachment.decrypt(new M.EncryptedAttachment(data, info)); }
+  async mediaLimit() {
+    try { return (await this.api('GET', '/_matrix/client/v1/media/config')).json['m.upload.size'] ?? null; } catch { return null; }
+  }
+  async uploadMedia(bytes) {
+    const r = await fetch(this.hs + '/_matrix/media/v3/upload', { method: 'POST', headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/octet-stream' }, body: bytes });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new MatrixError(r.status, j, 'POST /_matrix/media/v3/upload');
+    return j.content_uri;
+  }
+  async downloadMedia(mxc) {
+    const m = /^mxc:\/\/([^/]+)\/(.+)$/.exec(mxc);
+    if (!m) throw new Error('not an mxc address');
+    const r = await fetch(`${this.hs}/_matrix/client/v1/media/download/${encodeURIComponent(m[1])}/${encodeURIComponent(m[2])}`, { headers: { authorization: `Bearer ${this.token}` } });
+    if (!r.ok) throw new MatrixError(r.status, await r.json().catch(() => ({})), 'GET media/download');
+    return new Uint8Array(await r.arrayBuffer());
   }
 
   takeInbox(type) { const got = this.toDeviceInbox.filter((m) => m.type === type); this.toDeviceInbox = this.toDeviceInbox.filter((m) => m.type !== type); return got; }

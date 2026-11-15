@@ -294,3 +294,46 @@ A bare WebRTC signaling server, ntfy or a webhook relay gives only delivery; it 
 His walls: no cross without a probe that found something; one cross per bridge per tick, and a bridge still open afterwards is a finding, never a loop; a bridge that is down is raised with its reason, never restarted silently. One `watch` entry (EVA·Pattern) is woven per tick that crossed or raised anything; a quiet tick writes nothing.
 
 Bridges ready today: `databaseBridge` (engine changes up, log entries down), `peerBridge` (another node of the same person; open only on a content gap, since exchange records always differ), `signalBridge` (is the signaling server answering). Tested: a quiet tick weaves nothing, a waiting database bridge is crossed once, a stuck bridge is crossed once and reported, a dead signaling server is raised.
+
+## 13. Transport: everything crosses over Matrix, nothing is stored in a room
+
+`lib/transport.mjs`, `lib/courier.mjs`. No node has to be reachable by another. The direct device-to-device call (sections 1 and 6) is now an optional fast path, not a requirement.
+
+**Where data lives:** in each device's own store, as ciphertext. Matrix carries it; it does not keep it in rooms.
+
+**The ladder:**
+
+| rung | when | how |
+|---|---|---|
+| to-device | the gzipped payload is under 24 KB | one Olm-encrypted to-device message. If the other device is online it arrives at once; if not, the homeserver queues it and deletes it on delivery. |
+| media store | anything larger | gzip, cut into shards, encrypt each shard with Matrix's own encrypted-attachment scheme (AES-256-CTR, sha256 of the ciphertext), upload, and send the manifest (addresses and keys) as a to-device message. The other device fetches the shards when it is next online, checks each hash, decrypts, joins, gunzips. |
+
+- **Order:** gzip first, because ciphertext does not compress; then shard; then encrypt each shard, so each is verifiable and retriable alone.
+- **Sharding** is for the server's upload limit. It adds no secrecy.
+- **Online or offline is the same code path.** A to-device message is delivered immediately to a device that is syncing and queued for one that is not.
+
+**The CRDT is the log itself.** A pharos log is a grow-only set of entries, and union by id is the merge. So syncing two of a person's devices is: one says which ids it holds (`peer.offer`), the other sends what is lacking and its own ids (`peer.entries`), the first sends what the other lacks. Only what is lacking travels. A library such as Yjs or Automerge would be for live co-editing of one document, which is not built.
+
+**Between different people's nodes:** `net.want` asks the holder for a network's records and gets `net.records` or `net.refused`; `net.submit` hands in a record and gets `net.ack`. Membership is asked of the homeserver when the holder handles the message, so a node removed while the holder was offline is refused even for a request it sent while still a member.
+
+**Tested on Synapse and Conduit** (`test/carry.e2e.test.mjs`), with no device server running:
+
+- two devices of one person sync small data through to-device messages only, and only what the other lacked is sent;
+- with one device offline, 40 records (208 KB, 138 KB gzipped) cross as 9 encrypted shards, and the device merges and decrypts all 40 when it returns;
+- a stored shard is not gzip and contains no entry structure, record text or user id;
+- another account on the same server receives no manifest;
+- a shard altered by one bit is refused;
+- another person's offer to merge is refused (`not_own_user`);
+- a second person reads and writes a network over Matrix alone, and after removal a request sent earlier is refused.
+
+**What this costs, said plainly:**
+
+- **The media store does hold ciphertext on the homeserver.** The Matrix client API has no way to delete media; only the server's operator can purge it or set retention. On a server you installed that is in your hands. On someone else's server the shards outlive the exchange. Every upload's address is returned to the sender so it can be recorded and purged where that is possible; the purge itself is not built.
+- **The homeserver sees** sizes, timing and who sent to whom, for both rungs.
+- **A to-device queue is not unlimited.** Servers cap how much they hold for an offline device. Large or long-offline cases belong on the media rung; where the cap is has not been measured.
+- **Not built:** a live WebRTC channel for fast traffic when both are online; presence (the ladder chooses by size, never by guessing who is online); resuming a partly fetched payload; sending in several payloads when one manifest would itself exceed a message.
+
+**The encrypted database on the device** is two different things, and both are wanted:
+
+1. each record encrypted under its network's keys (built: this is what is shared and what removal acts on);
+2. the whole local database encrypted under a device key, for querying on the device (not built; it would be a local, rebuildable copy, never the thing that is shared).
