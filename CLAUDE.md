@@ -32,6 +32,7 @@ Level `L2-satellite`. Default branch `main`.
 5. Do not push, merge or change user-level configuration without the owner's yes. Commit only paths you can name.
 6. Quote every number with its split (dev, fresh, held-out, reused, exploratory) and its stamp. A measure that changed is a new row or a recorded pin, never the same number under the same name.
 7. A negative result is a finding: record it with its falsifier.
+8. Language is read by the reader, never by a pattern: a sentence, a question, a name or a relation goes through the reader's rows (its UD codec) to marks in EOT, and matching and reasoning happen on those marks, never on surface strings; a language with no codec is a typed gap, never English by default. Carry the text-regex ratchet (the count of regex applications may not grow); a pattern on a path, hash, id or file format is declared `// regex-ok: <why it is not language>`.
 
 ## Before you start
 - `git fetch`; work from `origin/main` and name the commit you read.
