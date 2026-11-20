@@ -16,6 +16,11 @@ jobs:
         run: |
           curl -fsS --retry 3 -o "$RUNNER_TEMP/kit.md" https://raw.githubusercontent.com/scores-patch-points/scores-patch-points/main/nexus/kits/heimdall/CLAUDE.md
           diff -u "$RUNNER_TEMP/kit.md" CLAUDE.md
+      - name: language is read by the reader, not a pattern (nexus rule 8: the text-regex ratchet)
+        run: |
+          curl -fsS --retry 3 -o .nexus-text-regex-ratchet.mjs https://raw.githubusercontent.com/scores-patch-points/scores-patch-points/main/nexus/guards/text-regex-ratchet.mjs
+          if [ -f gym/text-regex-baseline.jsonl ] || [ -f text-regex-baseline.jsonl ]; then node .nexus-text-regex-ratchet.mjs; else
+            echo "::notice::the text-regex ratchet checked NOTHING here: this repo has no text-regex-baseline.jsonl. Copy nexus/guards/text-regex-ratchet.mjs, run it with --record --why 'initial baseline', and commit the baseline."; fi
       - name: gate is a typed gap
         run: |
           echo "::notice::gate is a typed gap: not verified in a clean checkout. Name one in nexus/nexus.json (scores-patch-points) and regenerate."
